@@ -11,7 +11,7 @@ from google.oauth2 import service_account
 from pydantic import BaseModel
 
 app = FastAPI()
-model = WhisperModel("small", device="cpu", compute_type="int8")
+model = WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
