@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 faster-whisper
 requests
+google-auth
