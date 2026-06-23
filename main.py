@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import tempfile
@@ -13,9 +14,18 @@ app = FastAPI()
 model = WhisperModel("small", device="cpu", compute_type="int8")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-# JSON da service account vem inteiro na env var GOOGLE_SA_JSON.
+
+
+def load_sa_info():
+    raw = os.environ["GOOGLE_SA_JSON"].strip()
+    try:
+        return json.loads(raw)  # JSON cru
+    except json.JSONDecodeError:
+        return json.loads(base64.b64decode(raw))  # base64 do JSON
+
+
 creds = service_account.Credentials.from_service_account_info(
-    json.loads(os.environ["GOOGLE_SA_JSON"]), scopes=SCOPES
+    load_sa_info(), scopes=SCOPES
 )
 
 
