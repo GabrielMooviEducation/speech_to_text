@@ -1,18 +1,41 @@
+import os
 import tempfile
 
-from fastapi import FastAPI, Request
+import requests
+from fastapi import FastAPI, HTTPException
 from faster_whisper import WhisperModel
+from pydantic import BaseModel
 
 app = FastAPI()
 model = WhisperModel("small")
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+
+class Body(BaseModel):
+    file_id: str
+
+
+def download_from_drive(file_id: str, dest: str):
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+    params = {"alt": "media", "key": GOOGLE_API_KEY}
+    with requests.get(url, params=params, stream=True) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 16):
+                f.write(chunk)
+
 
 @app.post("/transcribe")
-async def transcribe(request: Request):
-    data = await request.body()
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        tmp.write(data)
-        tmp.flush()
-        segments, _ = model.transcribe(tmp.name)
+def transcribe(body: Body):
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        path = tmp.name
+    try:
+        download_from_drive(body.file_id, path)
+        segments, _ = model.transcribe(path)
         text = " ".join(seg.text.strip() for seg in segments)
+    except requests.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Falha ao baixar do Drive: {exc}")
+    finally:
+        os.remove(path)
     return {"text": text}
