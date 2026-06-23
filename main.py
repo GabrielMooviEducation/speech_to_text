@@ -7,7 +7,7 @@ from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
 app = FastAPI()
-model = WhisperModel("small")
+model = WhisperModel("small", device="cpu", compute_type="int8")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
@@ -22,7 +22,7 @@ def download_from_drive(file_id: str, dest: str):
     with requests.get(url, params=params, stream=True) as r:
         if r.status_code != 200:
             raise HTTPException(
-                status_code=502,
+                status_code=400,
                 detail=f"Drive recusou ({r.status_code}): {r.text[:500]}",
             )
         with open(dest, "wb") as f:
@@ -39,7 +39,7 @@ def transcribe(body: Body):
         segments, _ = model.transcribe(path)
         text = " ".join(seg.text.strip() for seg in segments)
     except requests.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Falha ao baixar do Drive: {exc}")
+        raise HTTPException(status_code=400, detail=f"Falha ao baixar do Drive: {exc}")
     finally:
         os.remove(path)
     return {"text": text}
