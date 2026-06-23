@@ -20,7 +20,11 @@ def download_from_drive(file_id: str, dest: str):
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
     params = {"alt": "media", "key": GOOGLE_API_KEY}
     with requests.get(url, params=params, stream=True) as r:
-        r.raise_for_status()
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Drive recusou ({r.status_code}): {r.text[:500]}",
+            )
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 16):
                 f.write(chunk)
