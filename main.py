@@ -29,8 +29,15 @@ creds = service_account.Credentials.from_service_account_info(
 )
 
 
+DEFAULT_PROMPT = os.getenv(
+    "DEFAULT_PROMPT",
+    "Transcrição de um vídeo em português do Brasil.",
+)
+
+
 class Body(BaseModel):
     file_id: str
+    prompt: str | None = None
 
 
 def get_token() -> str:
@@ -60,7 +67,12 @@ def transcribe(body: Body):
         path = tmp.name
     try:
         download_from_drive(body.file_id, path)
-        segments, _ = model.transcribe(path)
+        segments, _ = model.transcribe(
+            path,
+            language="pt",
+            vad_filter=True,
+            initial_prompt=body.prompt or DEFAULT_PROMPT,
+        )
         text = " ".join(seg.text.strip() for seg in segments)
     finally:
         os.remove(path)
