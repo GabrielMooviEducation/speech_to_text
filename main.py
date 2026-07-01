@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import subprocess
 import tempfile
 
 import requests
@@ -106,6 +107,34 @@ def download_from_drive(file_id: str, dest: str):
                 f.write(chunk)
 
 
+# Limite duro da API de transcrição da OpenAI.
+OPENAI_MAX_BYTES = 25 * 1024 * 1024
+
+
+def extract_audio(video_path: str) -> str:
+    """Extrai o áudio do vídeo em mono/16kHz/MP3 comprimido via ffmpeg.
+
+    Whisper (local e OpenAI) só usa áudio, e 16kHz mono é o formato ideal pro
+    modelo. Comprimir aqui derruba o tamanho de centenas de MB (vídeo) pra ~14MB
+    por hora de aula — o que mantém a chamada da OpenAI abaixo do teto de 25MB.
+    """
+    audio_path = video_path + ".mp3"
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+            audio_path,
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ffmpeg falhou: {proc.stderr.decode('utf-8', 'ignore')[:500]}",
+        )
+    return audio_path
+
+
 def transcribe_local(path: str, prompt: str | None) -> str:
     segments, _ = get_local_model().transcribe(
         path,
@@ -122,7 +151,17 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
             status_code=503,
             detail="USE_OPENAI=true mas OPENAI_KEY não configurada.",
         )
-    # A API da OpenAI tem limite de 25 MB por arquivo — vídeos grandes vão falhar.
+    # Recebe o áudio já extraído/comprimido; ainda assim protege o teto de 25MB
+    # (aulas muito longas podem estourar mesmo comprimidas).
+    size = os.path.getsize(path)
+    if size > OPENAI_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Áudio de {size // (1024 * 1024)}MB excede o limite de 25MB da "
+                "OpenAI. Use o motor local (USE_OPENAI=false) para esta aula."
+            ),
+        )
     with open(path, "rb") as f:
         resp = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
@@ -132,7 +171,7 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
                 "language": "pt",
                 "prompt": prompt or DEFAULT_PROMPT,
             },
-            files={"file": (os.path.basename(path), f, "video/mp4")},
+            files={"file": (os.path.basename(path), f, "audio/mpeg")},
             timeout=600,
         )
     if resp.status_code != 200:
@@ -145,14 +184,19 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
 
 def run_transcription(file_id: str, prompt: str | None) -> str:
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        path = tmp.name
+        video_path = tmp.name
+    audio_path = None
     try:
-        download_from_drive(file_id, path)
+        download_from_drive(file_id, video_path)
+        audio_path = extract_audio(video_path)
         if USE_OPENAI:
-            return transcribe_openai(path, prompt)
-        return transcribe_local(path, prompt)
+            return transcribe_openai(audio_path, prompt)
+        return transcribe_local(audio_path, prompt)
     finally:
-        os.remove(path)
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if os.path.exists(video_path):
+            os.remove(video_path)
 
 
 @app.post("/transcribe")
