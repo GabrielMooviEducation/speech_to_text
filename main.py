@@ -4,16 +4,46 @@ import os
 import tempfile
 
 import requests
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from faster_whisper import WhisperModel
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import service_account
 from pydantic import BaseModel
 
+load_dotenv()  # carrega variáveis do arquivo .env, se existir
+
 app = FastAPI()
-model = WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+# --- Escolha do motor de transcrição --------------------------------------
+# Por padrão usa o faster-whisper LOCAL. Setando USE_OPENAI=true no .env, usa a
+# API de transcrição da OpenAI (precisa de OPENAI_API_KEY). Assim dá pra rodar
+# sem baixar o modelo grande / sem CPU pesada.
+USE_OPENAI = os.getenv("USE_OPENAI", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Aceita OPENAI_KEY (nome usado no .env) ou OPENAI_API_KEY como fallback.
+OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "whisper-1")
+
+_local_model = None
+
+
+def get_local_model():
+    """Carrega o WhisperModel local só na 1ª vez (lazy) pra não segurar RAM
+    quando o serviço está configurado pra usar a OpenAI."""
+    global _local_model
+    if _local_model is None:
+        from faster_whisper import WhisperModel
+
+        _local_model = WhisperModel(
+            "large-v3", device="cpu", compute_type="int8"
+        )
+    return _local_model
+
 
 # Segredo compartilhado com o moovi_class: vai no header do callback pra que o
 # receptor confirme que a chamada veio mesmo deste serviço.
@@ -76,18 +106,51 @@ def download_from_drive(file_id: str, dest: str):
                 f.write(chunk)
 
 
+def transcribe_local(path: str, prompt: str | None) -> str:
+    segments, _ = get_local_model().transcribe(
+        path,
+        language="pt",
+        vad_filter=True,
+        initial_prompt=prompt or DEFAULT_PROMPT,
+    )
+    return " ".join(seg.text.strip() for seg in segments)
+
+
+def transcribe_openai(path: str, prompt: str | None) -> str:
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="USE_OPENAI=true mas OPENAI_KEY não configurada.",
+        )
+    # A API da OpenAI tem limite de 25 MB por arquivo — vídeos grandes vão falhar.
+    with open(path, "rb") as f:
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            data={
+                "model": OPENAI_MODEL,
+                "language": "pt",
+                "prompt": prompt or DEFAULT_PROMPT,
+            },
+            files={"file": (os.path.basename(path), f, "video/mp4")},
+            timeout=600,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI recusou ({resp.status_code}): {resp.text[:500]}",
+        )
+    return resp.json()["text"].strip()
+
+
 def run_transcription(file_id: str, prompt: str | None) -> str:
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         path = tmp.name
     try:
         download_from_drive(file_id, path)
-        segments, _ = model.transcribe(
-            path,
-            language="pt",
-            vad_filter=True,
-            initial_prompt=prompt or DEFAULT_PROMPT,
-        )
-        return " ".join(seg.text.strip() for seg in segments)
+        if USE_OPENAI:
+            return transcribe_openai(path, prompt)
+        return transcribe_local(path, prompt)
     finally:
         os.remove(path)
 

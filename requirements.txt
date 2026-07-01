@@ -3,3 +3,4 @@ uvicorn[standard]
 faster-whisper
 requests
 google-auth
+python-dotenv
