@@ -128,9 +128,12 @@ def extract_audio(video_path: str) -> str:
         capture_output=True,
     )
     if proc.returncode != 0:
+        # O erro real do ffmpeg sai no FIM do stderr; o começo é só o banner de
+        # versão/config. Por isso pegamos a cauda (-500), não a cabeça.
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
         raise HTTPException(
             status_code=500,
-            detail=f"ffmpeg falhou: {proc.stderr.decode('utf-8', 'ignore')[:500]}",
+            detail=f"ffmpeg falhou: {stderr[-500:]}",
         )
     return audio_path
 
