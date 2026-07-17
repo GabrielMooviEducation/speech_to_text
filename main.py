@@ -6,10 +6,12 @@ import tempfile
 
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import service_account
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 load_dotenv()  # carrega variáveis do arquivo .env, se existir
 
@@ -228,6 +230,53 @@ def process_and_callback(file_id: str, prompt: str | None, lesson_id: str):
         requests.post(CALLBACK_URL, json=payload, headers=headers, timeout=30)
     except requests.RequestException:
         pass  # callback inalcançável: o moovi_class fica em PROCESSING (reprocessável)
+
+
+# --- Remux (conserta a barra de progresso dos vídeos exportados) ----------
+# O MediaRecorder do navegador grava "ao vivo" e NÃO escreve a duração no
+# cabeçalho do arquivo — por isso o player não mostra progresso (cursor preso no
+# início). Aqui reescrevemos o container SEM re-encodar (`-c copy`, rápido) e, no
+# mp4, com `+faststart` (move o índice pro começo) — o arquivo fica seekável.
+# Reaproveita o ffmpeg que já existe pra transcrição.
+
+
+@app.post("/remux")
+async def remux(request: Request, ext: str = "mp4"):
+    ext = "webm" if ext.lower() == "webm" else "mp4"
+    suffix = f".{ext}"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tin:
+        in_path = tin.name
+        wrote = 0
+        async for chunk in request.stream():
+            tin.write(chunk)
+            wrote += len(chunk)
+    if wrote == 0:
+        os.remove(in_path)
+        raise HTTPException(status_code=400, detail="Corpo vazio.")
+
+    out_path = in_path + ".out" + suffix
+    cmd = ["ffmpeg", "-y", "-i", in_path, "-c", "copy"]
+    if ext == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += [out_path]
+
+    proc = subprocess.run(cmd, capture_output=True)
+    os.remove(in_path)
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-500:]}")
+
+    media = "video/mp4" if ext == "mp4" else "video/webm"
+    # Remove o arquivo de saída DEPOIS que a resposta terminar de ser enviada.
+    return FileResponse(
+        out_path,
+        media_type=media,
+        filename=f"remux.{ext}",
+        background=BackgroundTask(os.remove, out_path),
+    )
 
 
 @app.post("/transcribe-async", status_code=202)
