@@ -1,8 +1,10 @@
 import base64
 import json
 import os
+import re
 import subprocess
 import tempfile
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -277,6 +279,66 @@ async def remux(request: Request, ext: str = "mp4"):
         filename=f"remux.{ext}",
         background=BackgroundTask(os.remove, out_path),
     )
+
+
+# --- Onda do áudio (picos) ------------------------------------------------
+# O editor mostra a forma de onda do áudio. Gerar isso no navegador exigiria
+# baixar o vídeo inteiro (centenas de MB) e decodificar — trava. Aqui o ffmpeg lê
+# a URL do MinIO, extrai o áudio (mono/8kHz) e devolvemos só os PICOS normalizados
+# (um JSON pequeno). O moovi_class chama uma vez e cacheia.
+
+
+class PeaksBody(BaseModel):
+    url: str
+    buckets: int | None = None
+
+
+def _is_safe_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname or ""
+    # Bloqueia hosts internos (SSRF): localhost, loopback, redes privadas.
+    if host in ("localhost", "0.0.0.0"):
+        return False
+    if re.match(r"^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)", host):
+        return False
+    if host.endswith(".internal") or host.endswith(".local"):
+        return False
+    return True
+
+
+@app.post("/peaks")
+def peaks(body: PeaksBody):
+    if not _is_safe_url(body.url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
+    buckets = max(50, min(body.buckets or 900, 4000))
+
+    # ffmpeg lê a URL direto e joga PCM (s16le mono 8kHz) no stdout.
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-i", body.url,
+            "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-400:]}")
+
+    import numpy as np
+
+    raw = proc.stdout
+    arr = np.frombuffer(raw[: len(raw) - (len(raw) % 2)], dtype=np.int16)
+    if arr.size == 0:
+        return {"peaks": []}
+    arr = np.abs(arr.astype(np.float32))
+    n_buckets = min(buckets, arr.size)
+    per = arr.size // n_buckets
+    trimmed = arr[: per * n_buckets].reshape(n_buckets, per)
+    peaks = trimmed.max(axis=1)
+    top = float(peaks.max()) or 1.0
+    return {"peaks": [round(float(p) / top, 4) for p in peaks]}
 
 
 @app.post("/transcribe-async", status_code=202)
