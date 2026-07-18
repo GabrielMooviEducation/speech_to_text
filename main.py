@@ -341,6 +341,60 @@ def peaks(body: PeaksBody):
     return {"peaks": [round(float(p) / top, 4) for p in peaks]}
 
 
+# --- Remux por URL (conserta as fontes: duração + índice/cues) ------------
+# O WebM do MediaRecorder vem com duration=Infinity e sem cues → trava seek e
+# playback. Aqui o ffmpeg lê a fonte no MinIO, reescreve o container (-c copy,
+# sem re-encode) num arquivo temporário SEEKÁVEL (aí escreve os cues) e faz PUT
+# direto no MinIO (URL presigned). O arquivo grande NÃO passa pelo moovi_class.
+
+
+class RemuxUrlBody(BaseModel):
+    url: str
+    upload_url: str
+    ext: str | None = None
+
+
+@app.post("/remux-url")
+def remux_url(body: RemuxUrlBody):
+    if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
+    ext = "mp4" if (body.ext or "").lower() == "mp4" else "webm"
+
+    tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+    out_path = tmp.name
+    tmp.close()
+
+    cmd = ["ffmpeg", "-nostdin", "-y", "-i", body.url, "-c", "copy"]
+    if ext == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += [out_path]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-400:]}")
+
+    try:
+        content_type = "video/mp4" if ext == "mp4" else "video/webm"
+        with open(out_path, "rb") as f:  # streaming (não carrega tudo na RAM)
+            put = requests.put(
+                body.upload_url,
+                data=f,
+                headers={"Content-Type": content_type},
+                timeout=1800,
+            )
+        if put.status_code not in (200, 204):
+            raise HTTPException(
+                status_code=502,
+                detail=f"PUT no MinIO falhou ({put.status_code}).",
+            )
+    finally:
+        os.remove(out_path)
+
+    return {"ok": True}
+
+
 @app.post("/transcribe-async", status_code=202)
 def transcribe_async(body: AsyncBody, background: BackgroundTasks):
     if not CALLBACK_URL:
