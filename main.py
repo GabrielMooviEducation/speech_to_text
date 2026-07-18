@@ -364,7 +364,10 @@ def remux_url(body: RemuxUrlBody):
     out_path = tmp.name
     tmp.close()
 
-    cmd = ["ffmpeg", "-nostdin", "-y", "-i", body.url, "-c", "copy"]
+    # `-fflags +genpts`: regenera timestamps (a tela do MediaRecorder é VFR e às
+    # vezes o -c copy puro não fecha a duração). Se o copy falhar, o chamador vê o
+    # stderr e a gente decide re-encodar.
+    cmd = ["ffmpeg", "-nostdin", "-fflags", "+genpts", "-y", "-i", body.url, "-c", "copy"]
     if ext == "mp4":
         cmd += ["-movflags", "+faststart"]
     cmd += [out_path]
