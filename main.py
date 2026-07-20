@@ -431,7 +431,7 @@ def _run_prepare(
 
     cmd = [
         "ffmpeg", "-nostdin", "-y", "-i", url,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
         "-c:a", "aac", "-b:a", "128k",
