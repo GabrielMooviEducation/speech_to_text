@@ -398,6 +398,61 @@ def remux_url(body: RemuxUrlBody):
     return {"ok": True}
 
 
+# --- Prepara fonte pro export rápido (MP4/H.264, keyframes densos) ---------
+# O WebM VP9 do MediaRecorder é ruim pra processar no cliente (Infinity, GOP
+# esparso, sem demuxer maduro). Aqui re-encodamos pra MP4/H.264 com keyframe a
+# cada 15 frames (-g 15) → seek rápido no cliente E pronto pro mp4box+VideoDecoder.
+# PUT direto no MinIO (URL presigned). Arquivo grande NÃO passa pelo moovi_class.
+
+
+class PrepareSourceBody(BaseModel):
+    url: str
+    upload_url: str
+
+
+@app.post("/prepare-source")
+def prepare_source(body: PrepareSourceBody):
+    if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out_path = tmp.name
+    tmp.close()
+
+    cmd = [
+        "ffmpeg", "-nostdin", "-y", "-i", body.url,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p",
+        "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-400:]}")
+
+    try:
+        with open(out_path, "rb") as f:
+            put = requests.put(
+                body.upload_url,
+                data=f,
+                headers={"Content-Type": "video/mp4"},
+                timeout=3600,
+            )
+        if put.status_code not in (200, 204):
+            raise HTTPException(
+                status_code=502, detail=f"PUT no MinIO falhou ({put.status_code})."
+            )
+    finally:
+        os.remove(out_path)
+
+    return {"ok": True}
+
+
 @app.post("/transcribe-async", status_code=202)
 def transcribe_async(body: AsyncBody, background: BackgroundTasks):
     if not CALLBACK_URL:
