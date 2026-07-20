@@ -408,49 +408,85 @@ def remux_url(body: RemuxUrlBody):
 class PrepareSourceBody(BaseModel):
     url: str
     upload_url: str
+    duration_sec: float | None = None
 
 
-@app.post("/prepare-source")
-def prepare_source(body: PrepareSourceBody):
-    if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
-        raise HTTPException(status_code=400, detail="URL não permitida.")
+# Estado dos jobs de re-encode, em memória (chave = URL da fonte). Assíncrono pra
+# o professor poder sair da tela — o job segue no servidor e o resultado vai pro
+# MinIO (a existência do objeto é a verdade do "pronto"). `progress` 0..1.
+_prepare_jobs: dict[str, dict] = {}
 
+
+def _run_prepare(url: str, upload_url: str, duration_sec: float):
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     out_path = tmp.name
     tmp.close()
+    err_f = tempfile.TemporaryFile()
 
     cmd = [
-        "ffmpeg", "-nostdin", "-y", "-i", body.url,
+        "ffmpeg", "-nostdin", "-y", "-i", url,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         "-pix_fmt", "yuv420p",
         "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats",
         out_path,
     ]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0 or not os.path.exists(out_path):
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        stderr = proc.stderr.decode("utf-8", "ignore").strip()
-        raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-400:]}")
-
     try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=err_f, text=True
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:  # -progress: linhas key=value
+            line = line.strip()
+            if line.startswith("out_time_ms=") and duration_sec > 0:
+                try:
+                    ms = int(line.split("=", 1)[1])
+                    _prepare_jobs[url]["progress"] = max(
+                        0.0, min(0.99, (ms / 1_000_000.0) / duration_sec)
+                    )
+                except ValueError:
+                    pass
+        proc.wait()
+        if proc.returncode != 0:
+            err_f.seek(0)
+            err = err_f.read().decode("utf-8", "ignore")[-400:]
+            _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": f"ffmpeg: {err}"}
+            return
+
         with open(out_path, "rb") as f:
             put = requests.put(
-                body.upload_url,
+                upload_url,
                 data=f,
                 headers={"Content-Type": "video/mp4"},
                 timeout=3600,
             )
         if put.status_code not in (200, 204):
-            raise HTTPException(
-                status_code=502, detail=f"PUT no MinIO falhou ({put.status_code})."
-            )
-    finally:
-        os.remove(out_path)
+            _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": f"PUT {put.status_code}"}
+            return
 
-    return {"ok": True}
+        _prepare_jobs[url] = {"status": "done", "progress": 1.0, "error": None}
+    except Exception as e:  # noqa: BLE001
+        _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": str(e)[:300]}
+    finally:
+        err_f.close()
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+
+@app.post("/prepare-source-async", status_code=202)
+def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
+    if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
+    job = _prepare_jobs.get(body.url)
+    if job and job.get("status") == "processing":
+        return {"status": "processing", "progress": job.get("progress", 0.0)}
+    _prepare_jobs[body.url] = {"status": "processing", "progress": 0.0, "error": None}
+    background.add_task(
+        _run_prepare, body.url, body.upload_url, body.duration_sec or 0.0
+    )
+    return {"status": "processing", "progress": 0.0}
 
 
 @app.post("/transcribe-async", status_code=202)
