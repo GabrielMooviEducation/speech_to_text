@@ -409,6 +409,10 @@ class PrepareSourceBody(BaseModel):
     url: str
     upload_url: str
     duration_sec: float | None = None
+    # Quando setado, reamostra o vídeo pra esse fps constante (CFR). Usado só na
+    # TELA: o MediaRecorder gera timestamps irregulares e o ffmpeg dropa frames
+    # (a tela vira ~2fps e trava nas animações). A câmera fica sem isso.
+    force_fps: int | None = None
 
 
 # Estado dos jobs de re-encode, em memória (chave = URL da fonte). Assíncrono pra
@@ -417,7 +421,9 @@ class PrepareSourceBody(BaseModel):
 _prepare_jobs: dict[str, dict] = {}
 
 
-def _run_prepare(url: str, upload_url: str, duration_sec: float):
+def _run_prepare(
+    url: str, upload_url: str, duration_sec: float, force_fps: int | None = None
+):
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     out_path = tmp.name
     tmp.close()
@@ -431,8 +437,13 @@ def _run_prepare(url: str, upload_url: str, duration_sec: float):
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats",
-        out_path,
     ]
+    if force_fps:
+        # CFR: reamostra num relógio constante. O ffmpeg dropa frames da tela por
+        # causa dos timestamps irregulares do MediaRecorder; forçar fps constante
+        # recupera o movimento das animações. Preserva a duração (não dessincroniza).
+        cmd += ["-r", str(force_fps), "-vsync", "cfr"]
+    cmd += [out_path]
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=err_f, text=True
@@ -484,7 +495,11 @@ def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
         return {"status": "processing", "progress": job.get("progress", 0.0)}
     _prepare_jobs[body.url] = {"status": "processing", "progress": 0.0, "error": None}
     background.add_task(
-        _run_prepare, body.url, body.upload_url, body.duration_sec or 0.0
+        _run_prepare,
+        body.url,
+        body.upload_url,
+        body.duration_sec or 0.0,
+        body.force_fps,
     )
     return {"status": "processing", "progress": 0.0}
 
