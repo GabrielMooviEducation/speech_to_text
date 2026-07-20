@@ -423,10 +423,15 @@ def _run_prepare(url: str, upload_url: str, duration_sec: float):
     tmp.close()
     err_f = tempfile.TemporaryFile()
 
+    # `-r 30 -vsync cfr`: o WebM do MediaRecorder é VFR (frame rate variável), e
+    # sem forçar CFR o re-encode bagunça o timing → vídeo trava no player. CFR 30
+    # regulariza pra frames uniformes (fluido no export). Nada de filtro de áudio
+    # aqui: a tela não tem faixa de áudio e o filtro daria erro nela.
     cmd = [
         "ffmpeg", "-nostdin", "-y", "-i", url,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         "-pix_fmt", "yuv420p",
+        "-r", "30", "-vsync", "cfr",
         "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
