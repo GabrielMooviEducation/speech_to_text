@@ -1,23 +1,124 @@
 import base64
 import json
+import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
+import uuid
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import service_account
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 load_dotenv()  # carrega variáveis do arquivo .env, se existir
 
+# --- Logs -----------------------------------------------------------------
+# Tudo em stdout pra sair no `docker logs` do serviço. Quando uma transcrição
+# falha, o moovi_class só recebe a mensagem curta do callback — o diagnóstico
+# completo (etapa, tempo, stderr do ffmpeg, corpo do erro da API) fica aqui.
+# LOG_LEVEL=DEBUG liga os tracebacks de erros já esperados (HTTPException).
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)-7s %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,  # não deixa a config do uvicorn engolir a nossa
+)
+log = logging.getLogger("speech")
+
+MB = 1024 * 1024
+
+
+def describe_error(e: BaseException) -> str:
+    """Mensagem curta e informativa de uma exceção.
+
+    `str(e)` de uma HTTPException vira "500: ffmpeg falhou..." (útil), mas de um
+    KeyError vira só "'GOOGLE_SA_JSON'" — sem o tipo, ninguém entende. Por isso
+    prefixamos com o nome da classe nos erros que não são HTTP.
+    """
+    if isinstance(e, StarletteHTTPException):
+        return f"HTTP {e.status_code}: {e.detail}"
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
+@contextmanager
+def timed(step: str, tag: str, ctx: dict | None = None):
+    """Cronometra uma etapa e loga o fim (ok ou falha) sem mudar a exceção.
+
+    `ctx["step"]` guarda a etapa atual pra que, lá no fim, o erro enviado ao
+    moovi_class diga ONDE quebrou (download do Drive? ffmpeg? OpenAI?).
+    """
+    if ctx is not None:
+        ctx["step"] = step
+    started = time.monotonic()
+    log.info("%s | %s | início", tag, step)
+    try:
+        yield
+    except StarletteHTTPException as e:
+        log.error(
+            "%s | %s | FALHOU em %.1fs: %s",
+            tag, step, time.monotonic() - started, describe_error(e),
+        )
+        log.debug("%s | %s | traceback", tag, step, exc_info=True)
+        raise
+    except Exception:  # noqa: BLE001 — erro inesperado: traceback completo
+        log.exception(
+            "%s | %s | FALHOU em %.1fs (erro inesperado)",
+            tag, step, time.monotonic() - started,
+        )
+        raise
+    log.info("%s | %s | ok em %.1fs", tag, step, time.monotonic() - started)
+
+
 app = FastAPI()
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Uma linha por request (método, rota, status, tempo) + qualquer exceção
+    que escape dos handlers — é o que falta hoje pra saber que a chamada
+    sequer chegou no serviço."""
+    rid = uuid.uuid4().hex[:6]
+    started = time.monotonic()
+    log.info("req %s | %s %s", rid, request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "req %s | %s %s | EXCEÇÃO NÃO TRATADA em %.1fs",
+            rid, request.method, request.url.path, time.monotonic() - started,
+        )
+        raise
+    log.info(
+        "req %s | %s %s | %s em %.1fs",
+        rid, request.method, request.url.path,
+        response.status_code, time.monotonic() - started,
+    )
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def log_http_exception(request: Request, exc: StarletteHTTPException):
+    """Todo 4xx/5xx sai no console com o motivo — hoje o detalhe some na
+    resposta HTTP e nada fica registrado no servidor."""
+    log.warning(
+        "%s %s | %s: %s", request.method, request.url.path, exc.status_code, exc.detail
+    )
+    return await http_exception_handler(request, exc)
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -44,9 +145,14 @@ def get_local_model():
     if _local_model is None:
         from faster_whisper import WhisperModel
 
+        # 1ª transcrição depois do deploy baixa ~3GB de modelo: sem este log
+        # parece que o job travou.
+        log.info("carregando WhisperModel large-v3 (1ª vez pode baixar o modelo)...")
+        started = time.monotonic()
         _local_model = WhisperModel(
             "large-v3", device="cpu", compute_type="int8"
         )
+        log.info("WhisperModel carregado em %.1fs", time.monotonic() - started)
     return _local_model
 
 
@@ -61,11 +167,20 @@ CALLBACK_URL = os.getenv("TRANSCRIPTION_CALLBACK_URL")
 
 
 def load_sa_info():
-    raw = os.environ["GOOGLE_SA_JSON"].strip()
+    raw = os.getenv("GOOGLE_SA_JSON", "").strip()
+    if not raw:
+        log.error(
+            "GOOGLE_SA_JSON ausente — sem credencial não dá pra baixar do Drive."
+        )
+        raise RuntimeError("GOOGLE_SA_JSON não configurada.")
     try:
         return json.loads(raw)  # JSON cru
     except json.JSONDecodeError:
-        return json.loads(base64.b64decode(raw))  # base64 do JSON
+        try:
+            return json.loads(base64.b64decode(raw))  # base64 do JSON
+        except Exception as e:  # noqa: BLE001
+            log.error("GOOGLE_SA_JSON inválida (nem JSON, nem base64 de JSON).")
+            raise RuntimeError(f"GOOGLE_SA_JSON inválida: {describe_error(e)}") from e
 
 
 creds = service_account.Credentials.from_service_account_info(
@@ -77,6 +192,44 @@ DEFAULT_PROMPT = os.getenv(
     "DEFAULT_PROMPT",
     "Transcrição de um vídeo em português do Brasil.",
 )
+
+
+def _ffmpeg_version() -> str:
+    """Confere na subida se o ffmpeg existe — sem ele TODA transcrição falha, e
+    o erro só apareceria no meio de um job em background."""
+    try:
+        proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10)
+        first = proc.stdout.decode("utf-8", "ignore").splitlines()
+        return first[0] if first else "presente"
+    except Exception as e:  # noqa: BLE001
+        return f"AUSENTE ({describe_error(e)})"
+
+
+def _log_config() -> None:
+    log.info("=" * 60)
+    log.info("speech_to_text no ar | log_level=%s", LOG_LEVEL)
+    log.info(
+        "motor=%s | modelo=%s",
+        "openai" if USE_OPENAI else "local (faster-whisper)",
+        OPENAI_MODEL if USE_OPENAI else "large-v3",
+    )
+    if USE_OPENAI and not OPENAI_API_KEY:
+        log.error("USE_OPENAI=true mas OPENAI_KEY/OPENAI_API_KEY ausente.")
+    log.info("callback=%s", CALLBACK_URL or "NÃO CONFIGURADA (/transcribe-async dá 503)")
+    if not CALLBACK_SECRET:
+        log.warning(
+            "TRANSCRIPTION_CALLBACK_SECRET ausente — o moovi_class responde 401 "
+            "no callback e a aula fica presa em PROCESSING."
+        )
+    ffmpeg = _ffmpeg_version()
+    if ffmpeg.startswith("AUSENTE"):
+        log.error("ffmpeg=%s — nenhuma transcrição/remux vai funcionar.", ffmpeg)
+    else:
+        log.info("ffmpeg=%s", ffmpeg)
+    log.info("=" * 60)
+
+
+_log_config()
 
 
 class Body(BaseModel):
@@ -96,19 +249,27 @@ def get_token() -> str:
     return creds.token
 
 
-def download_from_drive(file_id: str, dest: str):
+def download_from_drive(file_id: str, dest: str) -> int:
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
     headers = {"Authorization": f"Bearer {get_token()}"}
     params = {"alt": "media", "supportsAllDrives": "true"}
     with requests.get(url, headers=headers, params=params, stream=True) as r:
         if r.status_code != 200:
+            # No log vai o corpo inteiro (permissão da service account, quota,
+            # arquivo removido...); na resposta HTTP continua truncado.
+            log.error("Drive recusou %s (file_id=%s): %s", r.status_code, file_id, r.text)
             raise HTTPException(
                 status_code=400,
                 detail=f"Drive recusou ({r.status_code}): {r.text[:500]}",
             )
+        total = 0
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 16):
                 f.write(chunk)
+                total += len(chunk)
+    if total == 0:
+        raise HTTPException(status_code=400, detail="Drive devolveu arquivo vazio.")
+    return total
 
 
 # Limite duro da API de transcrição da OpenAI.
@@ -135,6 +296,7 @@ def extract_audio(video_path: str) -> str:
         # O erro real do ffmpeg sai no FIM do stderr; o começo é só o banner de
         # versão/config. Por isso pegamos a cauda (-500), não a cabeça.
         stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        log.error("ffmpeg (extract_audio) saiu %s. stderr:\n%s", proc.returncode, stderr[-4000:])
         raise HTTPException(
             status_code=500,
             detail=f"ffmpeg falhou: {stderr[-500:]}",
@@ -182,23 +344,49 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
             timeout=600,
         )
     if resp.status_code != 200:
+        log.error("OpenAI recusou %s. Corpo:\n%s", resp.status_code, resp.text)
         raise HTTPException(
             status_code=502,
             detail=f"OpenAI recusou ({resp.status_code}): {resp.text[:500]}",
         )
-    return resp.json()["text"].strip()
+    try:
+        return resp.json()["text"].strip()
+    except (ValueError, KeyError) as e:
+        log.error("Resposta inesperada da OpenAI: %s", resp.text[:2000])
+        raise HTTPException(
+            status_code=502,
+            detail=f"Resposta inesperada da OpenAI ({describe_error(e)}).",
+        ) from e
 
 
-def run_transcription(file_id: str, prompt: str | None) -> str:
+def run_transcription(
+    file_id: str, prompt: str | None, tag: str = "sync", ctx: dict | None = None
+) -> str:
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         video_path = tmp.name
     audio_path = None
+    engine = f"openai/{OPENAI_MODEL}" if USE_OPENAI else "local/large-v3"
     try:
-        download_from_drive(file_id, video_path)
-        audio_path = extract_audio(video_path)
-        if USE_OPENAI:
-            return transcribe_openai(audio_path, prompt)
-        return transcribe_local(audio_path, prompt)
+        with timed("download do Drive", tag, ctx):
+            size = download_from_drive(file_id, video_path)
+            log.info("%s | vídeo baixado: %.1f MB", tag, size / MB)
+
+        with timed("extração de áudio (ffmpeg)", tag, ctx):
+            audio_path = extract_audio(video_path)
+            log.info("%s | áudio: %.1f MB", tag, os.path.getsize(audio_path) / MB)
+
+        with timed(f"transcrição ({engine})", tag, ctx):
+            text = (
+                transcribe_openai(audio_path, prompt)
+                if USE_OPENAI
+                else transcribe_local(audio_path, prompt)
+            )
+        log.info("%s | texto com %d caracteres", tag, len(text))
+        if not text.strip():
+            # O moovi_class trata texto vazio como falha; sem este aviso o log
+            # mostraria "ok" e a aula apareceria FAILED sem explicação.
+            log.warning("%s | transcrição VAZIA (áudio mudo?)", tag)
+        return text
     finally:
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
@@ -219,19 +407,44 @@ def process_and_callback(file_id: str, prompt: str | None, lesson_id: str):
     {lesson_id, error}. O moovi_class persiste o texto e atualiza o status.
     O destino é a CALLBACK_URL fixa do serviço (não vem da request).
     """
+    tag = f"lesson={lesson_id}"
+    ctx = {"step": "início"}
+    started = time.monotonic()
+    log.info("%s | JOB INICIADO (file_id=%s)", tag, file_id)
+
     try:
-        text = run_transcription(file_id, prompt)
+        text = run_transcription(file_id, prompt, tag, ctx)
         payload = {"lesson_id": lesson_id, "text": text}
+        log.info(
+            "%s | JOB OK em %.1fs (%d caracteres)",
+            tag, time.monotonic() - started, len(text),
+        )
     except Exception as e:  # noqa: BLE001 — qualquer falha vira status FAILED
-        payload = {"lesson_id": lesson_id, "error": str(e)[:500]}
+        # A etapa vai junto na mensagem: é ela que aparece no log do moovi_class
+        # ("[extração de áudio (ffmpeg)] HTTP 500: ...") e diz onde procurar aqui.
+        message = f"[{ctx['step']}] {describe_error(e)}"
+        log.error("%s | JOB FALHOU em %.1fs: %s", tag, time.monotonic() - started, message)
+        payload = {"lesson_id": lesson_id, "error": message[:500]}
 
     headers = {"Content-Type": "application/json"}
     if CALLBACK_SECRET:
         headers["X-Callback-Secret"] = CALLBACK_SECRET
     try:
-        requests.post(CALLBACK_URL, json=payload, headers=headers, timeout=30)
-    except requests.RequestException:
-        pass  # callback inalcançável: o moovi_class fica em PROCESSING (reprocessável)
+        resp = requests.post(CALLBACK_URL, json=payload, headers=headers, timeout=30)
+        if resp.status_code >= 300:
+            # 401 aqui = secret divergente entre os dois serviços; a aula fica
+            # em PROCESSING pra sempre e nada aparece na tela do professor.
+            log.error(
+                "%s | callback recusado (%s): %s", tag, resp.status_code, resp.text[:500]
+            )
+        else:
+            log.info("%s | callback entregue (%s)", tag, resp.status_code)
+    except requests.RequestException as e:
+        # callback inalcançável: o moovi_class fica em PROCESSING (reprocessável)
+        log.error(
+            "%s | callback inalcançável (%s): %s — a aula fica em PROCESSING",
+            tag, CALLBACK_URL, describe_error(e),
+        )
 
 
 # --- Remux (conserta a barra de progresso dos vídeos exportados) ----------
@@ -267,6 +480,7 @@ async def remux(request: Request, ext: str = "mp4"):
     os.remove(in_path)
     if proc.returncode != 0 or not os.path.exists(out_path):
         stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        log.error("ffmpeg (remux %s) saiu %s. stderr:\n%s", ext, proc.returncode, stderr[-4000:])
         if os.path.exists(out_path):
             os.remove(out_path)
         raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-500:]}")
@@ -324,6 +538,7 @@ def peaks(body: PeaksBody):
     )
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        log.error("ffmpeg (peaks) saiu %s. stderr:\n%s", proc.returncode, stderr[-4000:])
         raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-400:]}")
 
     import numpy as np
@@ -376,6 +591,9 @@ def remux_url(body: RemuxUrlBody):
         if os.path.exists(out_path):
             os.remove(out_path)
         stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        log.error(
+            "ffmpeg (remux-url %s) saiu %s. stderr:\n%s", ext, proc.returncode, stderr[-4000:]
+        )
         raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-400:]}")
 
     try:
@@ -428,6 +646,9 @@ def _run_prepare(
     out_path = tmp.name
     tmp.close()
     err_f = tempfile.TemporaryFile()
+    tag = f"prepare {os.path.basename(urlparse(url).path) or url[-40:]}"
+    started = time.monotonic()
+    log.info("%s | início (duração=%.1fs, fps=%s)", tag, duration_sec, force_fps or "original")
 
     cmd = [
         "ffmpeg", "-nostdin", "-y", "-i", url,
@@ -462,7 +683,9 @@ def _run_prepare(
         proc.wait()
         if proc.returncode != 0:
             err_f.seek(0)
-            err = err_f.read().decode("utf-8", "ignore")[-400:]
+            full = err_f.read().decode("utf-8", "ignore")
+            log.error("%s | ffmpeg saiu %s. stderr:\n%s", tag, proc.returncode, full[-4000:])
+            err = full[-400:]
             _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": f"ffmpeg: {err}"}
             return
 
@@ -474,12 +697,15 @@ def _run_prepare(
                 timeout=3600,
             )
         if put.status_code not in (200, 204):
+            log.error("%s | PUT no MinIO falhou (%s): %s", tag, put.status_code, put.text[:500])
             _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": f"PUT {put.status_code}"}
             return
 
+        log.info("%s | ok em %.1fs", tag, time.monotonic() - started)
         _prepare_jobs[url] = {"status": "done", "progress": 1.0, "error": None}
     except Exception as e:  # noqa: BLE001
-        _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": str(e)[:300]}
+        log.exception("%s | FALHOU em %.1fs", tag, time.monotonic() - started)
+        _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": describe_error(e)[:300]}
     finally:
         err_f.close()
         if os.path.exists(out_path):
@@ -511,6 +737,9 @@ def transcribe_async(body: AsyncBody, background: BackgroundTasks):
             status_code=503,
             detail="TRANSCRIPTION_CALLBACK_URL não configurada.",
         )
+    log.info(
+        "lesson=%s | job aceito (file_id=%s)", body.lesson_id, body.file_id
+    )
     background.add_task(
         process_and_callback,
         body.file_id,
