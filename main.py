@@ -616,21 +616,47 @@ def remux_url(body: RemuxUrlBody):
     return {"ok": True}
 
 
-# --- Prepara fonte pro export rápido (MP4/H.264, keyframes densos) ---------
+# --- Prepara as fontes (MP4/H.264, keyframes densos) -----------------------
 # O WebM VP9 do MediaRecorder é ruim pra processar no cliente (Infinity, GOP
 # esparso, sem demuxer maduro). Aqui re-encodamos pra MP4/H.264 com keyframe a
 # cada 15 frames (-g 15) → seek rápido no cliente E pronto pro mp4box+VideoDecoder.
 # PUT direto no MinIO (URL presigned). Arquivo grande NÃO passa pelo moovi_class.
+#
+# São DUAS saídas por fonte, tiradas do mesmo cru e com a MESMA timebase:
+#   full-res (CRF 20) → é o que o EXPORT lê; manda na qualidade final.
+#   proxy    (CRF 28, altura reduzida) → é o que o EDITOR toca; manda na
+#                                        velocidade de seek.
+# A timebase idêntica é o que garante que um corte marcado no proxy caia no mesmo
+# frame no full-res — por isso `force_fps` vale igual pros dois. Mexer no fps de
+# um sem mexer no outro dessincroniza os cortes.
+
+
+PROXY_CRF = 28
+FULL_CRF = 20
+# Fatia da barra de progresso reservada ao proxy. Ele é bem mais barato que o
+# full-res (menos pixel por frame), então fica com um pedaço pequeno.
+PROXY_PROGRESS_SHARE = 0.25
 
 
 class PrepareSourceBody(BaseModel):
     url: str
-    upload_url: str
+    # Saídas. Ambas opcionais, mas ao menos uma é obrigatória: uma gravação
+    # antiga já tem o full-res gerado e só precisa do proxy — re-encodar o
+    # full-res de novo nesse caso seria puro desperdício.
+    upload_url: str | None = None
+    proxy_upload_url: str | None = None
     duration_sec: float | None = None
-    # Quando setado, reamostra o vídeo pra esse fps constante (CFR). Usado só na
-    # TELA: o MediaRecorder gera timestamps irregulares e o ffmpeg dropa frames
-    # (a tela vira ~2fps e trava nas animações). A câmera fica sem isso.
+    # Quando setado, reamostra o vídeo pra esse fps constante (CFR). O
+    # MediaRecorder gera timestamps irregulares e o ffmpeg dropa frames (a tela
+    # vira ~2fps e trava nas animações).
     force_fps: int | None = None
+    # Altura alvo do proxy; a largura sai da proporção original, então o
+    # compositor do Class enquadra exatamente igual (a conta dele é por fração
+    # do canvas e por proporção da fonte, nunca por pixel).
+    proxy_height: int | None = None
+    # A tela é MUDA no Class (preview e export tiram o som da câmera), então o
+    # proxy dela dispensa faixa de áudio.
+    proxy_audio: bool = True
 
 
 # Estado dos jobs de re-encode, em memória (chave = URL da fonte). Assíncrono pra
@@ -639,57 +665,85 @@ class PrepareSourceBody(BaseModel):
 _prepare_jobs: dict[str, dict] = {}
 
 
-def _run_prepare(
-    url: str, upload_url: str, duration_sec: float, force_fps: int | None = None
-):
+def _encode_and_put(
+    src_url: str,
+    upload_url: str,
+    *,
+    job_key: str,
+    tag: str,
+    duration_sec: float,
+    force_fps: int | None,
+    crf: int,
+    scale_height: int | None = None,
+    audio_bitrate: str | None = "128k",
+    progress_from: float = 0.0,
+    progress_to: float = 1.0,
+) -> None:
+    """Re-encoda `src_url` num MP4/H.264 seekável e faz PUT no `upload_url`.
+
+    Levanta exceção em QUALQUER falha (ffmpeg ou PUT) — quem chama é que sabe se
+    aquele passo era essencial. O `-g 15` (keyframe a cada meio segundo) é o que
+    torna o seek rápido, tanto no <video> do editor quanto no VideoDecoder do
+    export. O progresso é reportado dentro da faixa [progress_from, progress_to]
+    pra que dois passos seguidos preencham uma barra só.
+    """
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     out_path = tmp.name
     tmp.close()
     err_f = tempfile.TemporaryFile()
-    tag = f"prepare {os.path.basename(urlparse(url).path) or url[-40:]}"
     started = time.monotonic()
-    log.info("%s | início (duração=%.1fs, fps=%s)", tag, duration_sec, force_fps or "original")
 
     cmd = [
-        "ffmpeg", "-nostdin", "-y", "-i", url,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "ffmpeg", "-nostdin", "-y", "-i", src_url,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
         "-pix_fmt", "yuv420p",
         "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats",
     ]
+    if scale_height:
+        # `-2` deriva a largura da proporção mantendo-a par (exigência do
+        # yuv420p). O `min(ih,...)` evita AUMENTAR uma fonte que já seja menor
+        # que o alvo — um "proxy" maior que o original seria o oposto do ponto.
+        # A vírgula vai escapada: dentro de um filtro ela separaria argumentos.
+        cmd += ["-vf", f"scale=-2:min(ih\\,{scale_height})"]
+    if audio_bitrate:
+        cmd += ["-c:a", "aac", "-b:a", audio_bitrate]
+    else:
+        cmd += ["-an"]
     if force_fps:
         # CFR: reamostra num relógio constante. O ffmpeg dropa frames da tela por
         # causa dos timestamps irregulares do MediaRecorder; forçar fps constante
         # recupera o movimento das animações. Preserva a duração (não dessincroniza).
         cmd += ["-r", str(force_fps), "-vsync", "cfr"]
-    cmd += [out_path]
+    cmd += ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out_path]
+
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=err_f, text=True
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f, text=True)
         assert proc.stdout is not None
+        span = max(0.0, progress_to - progress_from)
         for line in proc.stdout:  # -progress: linhas key=value
             line = line.strip()
-            if line.startswith("out_time_ms=") and duration_sec > 0:
-                try:
-                    ms = int(line.split("=", 1)[1])
-                    _prepare_jobs[url]["progress"] = max(
-                        0.0, min(0.99, (ms / 1_000_000.0) / duration_sec)
-                    )
-                except ValueError:
-                    pass
+            if not line.startswith("out_time_ms=") or duration_sec <= 0:
+                continue
+            try:
+                ms = int(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            done = min(1.0, max(0.0, (ms / 1_000_000.0) / duration_sec))
+            job = _prepare_jobs.get(job_key)
+            # O job some se alguém limpar o estado no meio; sem o `if`, uma
+            # gravação cancelada derrubaria o passo com KeyError.
+            if job is not None:
+                job["progress"] = min(0.99, progress_from + done * span)
         proc.wait()
         if proc.returncode != 0:
             err_f.seek(0)
             full = err_f.read().decode("utf-8", "ignore")
-            log.error("%s | ffmpeg saiu %s. stderr:\n%s", tag, proc.returncode, full[-4000:])
-            err = full[-400:]
-            _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": f"ffmpeg: {err}"}
-            return
+            log.error(
+                "%s | ffmpeg saiu %s. stderr:\n%s", tag, proc.returncode, full[-4000:]
+            )
+            raise RuntimeError(f"ffmpeg: {full[-400:]}")
 
-        with open(out_path, "rb") as f:
+        with open(out_path, "rb") as f:  # streaming (não carrega tudo na RAM)
             put = requests.put(
                 upload_url,
                 data=f,
@@ -697,24 +751,96 @@ def _run_prepare(
                 timeout=3600,
             )
         if put.status_code not in (200, 204):
-            log.error("%s | PUT no MinIO falhou (%s): %s", tag, put.status_code, put.text[:500])
-            _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": f"PUT {put.status_code}"}
-            return
+            log.error(
+                "%s | PUT no MinIO falhou (%s): %s", tag, put.status_code, put.text[:500]
+            )
+            raise RuntimeError(f"PUT {put.status_code}")
 
         log.info("%s | ok em %.1fs", tag, time.monotonic() - started)
-        _prepare_jobs[url] = {"status": "done", "progress": 1.0, "error": None}
-    except Exception as e:  # noqa: BLE001
-        log.exception("%s | FALHOU em %.1fs", tag, time.monotonic() - started)
-        _prepare_jobs[url] = {"status": "failed", "progress": 0.0, "error": describe_error(e)[:300]}
     finally:
         err_f.close()
         if os.path.exists(out_path):
             os.remove(out_path)
 
 
+def _run_prepare(
+    url: str,
+    upload_url: str | None,
+    duration_sec: float,
+    force_fps: int | None = None,
+    proxy_upload_url: str | None = None,
+    proxy_height: int | None = None,
+    proxy_audio: bool = True,
+):
+    tag = f"prepare {os.path.basename(urlparse(url).path) or url[-40:]}"
+    started = time.monotonic()
+    want_proxy = bool(proxy_upload_url and proxy_height)
+    log.info(
+        "%s | início (duração=%.1fs, fps=%s, proxy=%s, full=%s)",
+        tag,
+        duration_sec,
+        force_fps or "original",
+        f"{proxy_height}p" if want_proxy else "não",
+        "sim" if upload_url else "não",
+    )
+
+    # O proxy vem PRIMEIRO: é barato e destrava o editor enquanto o full-res
+    # ainda está rodando (quem decide "pronto" é a existência do objeto no
+    # MinIO, então o Class enxerga assim que ele aparece). Falha aqui é
+    # degradação, não erro: o editor cai na fonte cheia e só perde velocidade.
+    if want_proxy:
+        try:
+            _encode_and_put(
+                url,
+                proxy_upload_url,  # type: ignore[arg-type]  # want_proxy garante
+                job_key=url,
+                tag=f"{tag} [proxy]",
+                duration_sec=duration_sec,
+                force_fps=force_fps,
+                crf=PROXY_CRF,
+                scale_height=proxy_height,
+                audio_bitrate="96k" if proxy_audio else None,
+                progress_from=0.0,
+                progress_to=PROXY_PROGRESS_SHARE,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("%s [proxy] | falhou; seguindo só com o full-res", tag)
+
+    if upload_url:
+        try:
+            _encode_and_put(
+                url,
+                upload_url,
+                job_key=url,
+                tag=f"{tag} [full]",
+                duration_sec=duration_sec,
+                force_fps=force_fps,
+                crf=FULL_CRF,
+                audio_bitrate="128k",
+                progress_from=PROXY_PROGRESS_SHARE if want_proxy else 0.0,
+                progress_to=1.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("%s | FALHOU em %.1fs", tag, time.monotonic() - started)
+            _prepare_jobs[url] = {
+                "status": "failed",
+                "progress": 0.0,
+                "error": describe_error(e)[:300],
+            }
+            return
+
+    log.info("%s | ok em %.1fs", tag, time.monotonic() - started)
+    _prepare_jobs[url] = {"status": "done", "progress": 1.0, "error": None}
+
+
 @app.post("/prepare-source-async", status_code=202)
 def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
-    if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
+    outputs = [u for u in (body.upload_url, body.proxy_upload_url) if u]
+    if not outputs:
+        raise HTTPException(
+            status_code=400, detail="Nenhuma saída pedida (upload_url ou proxy)."
+        )
+    if not _is_safe_url(body.url) or not all(_is_safe_url(u) for u in outputs):
         raise HTTPException(status_code=400, detail="URL não permitida.")
     job = _prepare_jobs.get(body.url)
     if job and job.get("status") == "processing":
@@ -726,6 +852,9 @@ def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
         body.upload_url,
         body.duration_sec or 0.0,
         body.force_fps,
+        body.proxy_upload_url,
+        body.proxy_height,
+        body.proxy_audio,
     )
     return {"status": "processing", "progress": 0.0}
 
