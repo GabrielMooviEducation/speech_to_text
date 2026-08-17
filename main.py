@@ -845,6 +845,14 @@ def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
     job = _prepare_jobs.get(body.url)
     if job and job.get("status") == "processing":
         return {"status": "processing", "progress": job.get("progress", 0.0)}
+    if job and job.get("status") == "failed":
+        # REPORTA a falha uma vez e esquece o job. Sem isso o chamador nunca vê
+        # "failed" (a linha abaixo sobrescreveria o estado) e o polling do export
+        # dispararia um ffmpeg novo a cada consulta, indefinidamente. Esquecer o
+        # job faz a PRÓXIMA chamada ser uma nova tentativa, que é o que o
+        # professor espera ao clicar em exportar de novo.
+        _prepare_jobs.pop(body.url, None)
+        return {"status": "failed", "progress": 0.0, "error": job.get("error")}
     _prepare_jobs[body.url] = {"status": "processing", "progress": 0.0, "error": None}
     background.add_task(
         _run_prepare,
