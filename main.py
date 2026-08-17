@@ -25,7 +25,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 load_dotenv()  # carrega variáveis do arquivo .env, se existir
 
 # --- Logs -----------------------------------------------------------------
-# Tudo em stdout pra sair no `docker logs` do serviço. Quando uma transcrição
+# -Tudo em stdout pra sair no `docker logs` do serviço. Quando uma transcrição
 # falha, o moovi_class só recebe a mensagem curta do callback — o diagnóstico
 # completo (etapa, tempo, stderr do ffmpeg, corpo do erro da API) fica aqui.
 # LOG_LEVEL=DEBUG liga os tracebacks de erros já esperados (HTTPException).
