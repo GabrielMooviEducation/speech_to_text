@@ -22,6 +22,9 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import db
+import render
+
 load_dotenv()  # carrega variáveis do arquivo .env, se existir
 
 # --- Logs -----------------------------------------------------------------
@@ -221,6 +224,17 @@ def _log_config() -> None:
             "TRANSCRIPTION_CALLBACK_SECRET ausente — o moovi_class responde 401 "
             "no callback e a aula fica presa em PROCESSING."
         )
+    log.info(
+        "banco do class=%s | render=%d worker(s), fila máx %d",
+        "conectado" if db.configured() else "NÃO CONFIGURADO (DATABASE_URL ausente)",
+        render.RENDER_CONCURRENCY,
+        render.RENDER_QUEUE_MAX,
+    )
+    if not db.configured():
+        log.warning(
+            "DATABASE_URL ausente — o render roda, mas o moovi_class nunca vê o "
+            "progresso nem o estado final da exportação."
+        )
     ffmpeg = _ffmpeg_version()
     if ffmpeg.startswith("AUSENTE"):
         log.error("ffmpeg=%s — nenhuma transcrição/remux vai funcionar.", ffmpeg)
@@ -230,6 +244,7 @@ def _log_config() -> None:
 
 
 _log_config()
+render.start_workers()
 
 
 class Body(BaseModel):
@@ -865,6 +880,44 @@ def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
         body.proxy_audio,
     )
     return {"status": "processing", "progress": 0.0}
+
+
+# --- Montagem final do vídeo (editor de gravações) -------------------------
+# O plano de render é montado pelo moovi_class (que tem o compositor) e só é
+# EXECUTADO aqui. Ver render.py para o contrato e a estratégia.
+
+
+@app.post("/render-async", status_code=202)
+def render_async(plan: render.RenderPlan):
+    if not plan.segments:
+        raise HTTPException(status_code=400, detail="Plano sem segmentos.")
+    if plan.duration <= 0:
+        raise HTTPException(status_code=400, detail="Plano sem duração.")
+    bad = [u for u in plan.urls() if not _is_safe_url(u)]
+    if bad:
+        raise HTTPException(status_code=400, detail="URL não permitida no plano.")
+    # Uma camada só pode apontar pra fonte que o plano declarou — senão o erro
+    # apareceria lá na frente, como KeyError no meio do render.
+    keys = set(plan.sources)
+    used = {lay.source for s in plan.segments for lay in s.layers}
+    used |= {c.source for c in plan.audio_clips}
+    used |= {b.source for b in plan.audio_blocks}
+    missing = used - keys
+    if missing:
+        raise HTTPException(
+            status_code=400, detail=f"Fonte não declarada: {', '.join(sorted(missing))}"
+        )
+
+    result = render.enqueue(plan)
+    if result == "full":
+        raise HTTPException(
+            status_code=503, detail="Fila de renderização cheia. Tente em alguns minutos."
+        )
+    log.info(
+        "render %s | %s (fila=%d, %.1fs, %d segmento(s))",
+        plan.recording_id, result, render.pending(), plan.duration, len(plan.segments),
+    )
+    return {"status": result, "queued": render.pending()}
 
 
 @app.post("/transcribe-async", status_code=202)
