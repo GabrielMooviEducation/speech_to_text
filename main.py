@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import re
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -679,6 +681,57 @@ class PrepareSourceBody(BaseModel):
 # MinIO (a existência do objeto é a verdade do "pronto"). `progress` 0..1.
 _prepare_jobs: dict[str, dict] = {}
 
+# Preparos NÃO podem rodar todos de uma vez. Cada um é um ffmpeg CPU-bound que
+# escreve centenas de MB em disco antes do PUT; um punhado de gravações longas
+# chegando junto (o caso real: cinco de ~10 min) estoura RAM ou disco e o
+# container reinicia. Como o estado dos jobs vive em memória, o restart leva
+# junto até o "failed" — e do lado do Class tudo seguia parecendo "ainda
+# preparando", pra sempre. Uma fila com um worker troca latência por término.
+PREPARE_CONCURRENCY = max(1, int(os.getenv("PREPARE_CONCURRENCY", "1") or 1))
+PREPARE_QUEUE_MAX = max(1, int(os.getenv("PREPARE_QUEUE_MAX", "64") or 64))
+
+_prepare_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=PREPARE_QUEUE_MAX)
+_prepare_workers_started = False
+
+
+def _prepare_worker(n: int) -> None:
+    while True:
+        args = _prepare_queue.get()
+        url = args[0]
+        try:
+            _run_prepare(*args)
+        except Exception as e:  # noqa: BLE001
+            # Rede de segurança: `_run_prepare` já trata o que é dele, mas um
+            # worker morto em silêncio deixaria o job "processing" eterno.
+            log.exception("prepare | worker %d morreu processando %s", n, url)
+            _prepare_jobs[url] = {
+                "status": "failed",
+                "progress": 0.0,
+                "error": describe_error(e)[:300],
+            }
+        finally:
+            _prepare_queue.task_done()
+
+
+def start_prepare_workers() -> None:
+    """Sobe os workers uma vez, no import. Daemon: não seguram o shutdown."""
+    global _prepare_workers_started
+    if _prepare_workers_started:
+        return
+    _prepare_workers_started = True
+    for n in range(PREPARE_CONCURRENCY):
+        threading.Thread(
+            target=_prepare_worker, args=(n,), daemon=True, name=f"prepare-{n}"
+        ).start()
+    log.info(
+        "prepare | %d worker(s), fila máx %d", PREPARE_CONCURRENCY, PREPARE_QUEUE_MAX
+    )
+
+
+# Sobe aqui, e não junto do `render.start_workers()` lá em cima: a função (e o
+# `_run_prepare` que os workers chamam) só existem a partir deste ponto do módulo.
+start_prepare_workers()
+
 
 def _encode_and_put(
     src_url: str,
@@ -790,6 +843,8 @@ def _run_prepare(
     tag = f"prepare {os.path.basename(urlparse(url).path) or url[-40:]}"
     started = time.monotonic()
     want_proxy = bool(proxy_upload_url and proxy_height)
+    # Sai da fila: daqui pra frente o progresso relatado é real.
+    _prepare_jobs[url] = {"status": "processing", "progress": 0.0, "error": None}
     log.info(
         "%s | início (duração=%.1fs, fps=%s, proxy=%s, full=%s)",
         tag,
@@ -849,7 +904,7 @@ def _run_prepare(
 
 
 @app.post("/prepare-source-async", status_code=202)
-def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
+def prepare_source_async(body: PrepareSourceBody):
     outputs = [u for u in (body.upload_url, body.proxy_upload_url) if u]
     if not outputs:
         raise HTTPException(
@@ -858,8 +913,12 @@ def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
     if not _is_safe_url(body.url) or not all(_is_safe_url(u) for u in outputs):
         raise HTTPException(status_code=400, detail="URL não permitida.")
     job = _prepare_jobs.get(body.url)
-    if job and job.get("status") == "processing":
-        return {"status": "processing", "progress": job.get("progress", 0.0)}
+    if job and job.get("status") in ("queued", "processing"):
+        return {
+            "status": job["status"],
+            "progress": job.get("progress", 0.0),
+            "queued": _prepare_queue.qsize(),
+        }
     if job and job.get("status") == "failed":
         # REPORTA a falha uma vez e esquece o job. Sem isso o chamador nunca vê
         # "failed" (a linha abaixo sobrescreveria o estado) e o polling do export
@@ -868,18 +927,30 @@ def prepare_source_async(body: PrepareSourceBody, background: BackgroundTasks):
         # professor espera ao clicar em exportar de novo.
         _prepare_jobs.pop(body.url, None)
         return {"status": "failed", "progress": 0.0, "error": job.get("error")}
-    _prepare_jobs[body.url] = {"status": "processing", "progress": 0.0, "error": None}
-    background.add_task(
-        _run_prepare,
-        body.url,
-        body.upload_url,
-        body.duration_sec or 0.0,
-        body.force_fps,
-        body.proxy_upload_url,
-        body.proxy_height,
-        body.proxy_audio,
-    )
-    return {"status": "processing", "progress": 0.0}
+    # Marca ANTES de enfileirar: entre o `put` e o registro, uma segunda chamada
+    # veria "sem job" e enfileiraria o mesmo trabalho de novo.
+    _prepare_jobs[body.url] = {"status": "queued", "progress": 0.0, "error": None}
+    try:
+        _prepare_queue.put_nowait(
+            (
+                body.url,
+                body.upload_url,
+                body.duration_sec or 0.0,
+                body.force_fps,
+                body.proxy_upload_url,
+                body.proxy_height,
+                body.proxy_audio,
+            )
+        )
+    except queue.Full:
+        # Fila cheia é estado transitório: devolver "failed" faria o Class
+        # anunciar erro definitivo. Esquecer o job deixa a próxima consulta — o
+        # polling do editor — tentar de novo naturalmente.
+        _prepare_jobs.pop(body.url, None)
+        raise HTTPException(
+            status_code=503, detail="Fila de preparo cheia; tente em instantes."
+        )
+    return {"status": "queued", "progress": 0.0, "queued": _prepare_queue.qsize()}
 
 
 # --- Montagem final do vídeo (editor de gravações) -------------------------
