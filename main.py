@@ -766,6 +766,7 @@ def _encode_and_put(
         "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
         "-pix_fmt", "yuv420p",
         "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
+        "-threads", render.FFMPEG_THREADS,
     ]
     if scale_height:
         # `-2` deriva a largura da proporção mantendo-a par (exigência do

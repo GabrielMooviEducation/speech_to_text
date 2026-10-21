@@ -53,6 +53,10 @@ RENDER_QUEUE_MAX = int(os.getenv("RENDER_QUEUE_MAX", "32"))
 # MUITO menor que o VBR de 8 Mbps que o export do navegador usava.
 FINAL_CRF = int(os.getenv("RENDER_CRF", "20"))
 FINAL_PRESET = os.getenv("RENDER_PRESET", "veryfast")
+# Threads de cada ffmpeg que re-codifica vídeo (aqui e no /prepare). Sem teto o
+# x264 abre ~1,5 thread por núcleo da MÁQUINA inteira, não do limite do
+# container, e um render disputa CPU com todos os produtos do servidor.
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "4")
 AUDIO_BITRATE = "128k"
 SAMPLE_RATE = 48_000
 
@@ -232,6 +236,7 @@ def _encode_args() -> list[str]:
     return [
         "-c:v", "libx264", "-preset", FINAL_PRESET, "-crf", str(FINAL_CRF),
         "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-threads", FFMPEG_THREADS,
     ]
 
 
@@ -412,6 +417,7 @@ def _segment_cmd(
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
         *inputs,
         "-filter_complex", ";".join(filters),
+        "-filter_complex_threads", FFMPEG_THREADS,
         "-map", "[vout]", "-an",
         "-t", f"{seg.dur:.6f}",
         *_encode_args(),
