@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import captions
 import db
 import render
 
@@ -139,6 +140,10 @@ USE_OPENAI = os.getenv("USE_OPENAI", "false").strip().lower() in (
 # Aceita OPENAI_KEY (nome usado no .env) ou OPENAI_API_KEY como fallback.
 OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "whisper-1")
+# Só a família whisper devolve os trechos com tempo (`verbose_json`); os modelos
+# gpt-4o-*-transcribe aceitam apenas json/text. Com eles a transcrição segue
+# funcionando, só que sem legenda.
+OPENAI_TIMED = OPENAI_MODEL.startswith("whisper")
 
 _local_model = None
 
@@ -220,6 +225,11 @@ def _log_config() -> None:
     )
     if USE_OPENAI and not OPENAI_API_KEY:
         log.error("USE_OPENAI=true mas OPENAI_KEY/OPENAI_API_KEY ausente.")
+    if USE_OPENAI and not OPENAI_TIMED:
+        log.warning(
+            "OPENAI_MODEL=%s não devolve os tempos — as transcrições saem SEM legenda.",
+            OPENAI_MODEL,
+        )
     log.info("callback=%s", CALLBACK_URL or "NÃO CONFIGURADA (/transcribe-async dá 503)")
     if not CALLBACK_SECRET:
         log.warning(
@@ -321,17 +331,20 @@ def extract_audio(video_path: str) -> str:
     return audio_path
 
 
-def transcribe_local(path: str, prompt: str | None) -> str:
+def transcribe_local(path: str, prompt: str | None) -> tuple[str, list[captions.Segment]]:
     segments, _ = get_local_model().transcribe(
         path,
         language="pt",
         vad_filter=True,
         initial_prompt=prompt or DEFAULT_PROMPT,
     )
-    return " ".join(seg.text.strip() for seg in segments)
+    # `segments` é um gerador: a transcrição acontece ao percorrê-lo, uma vez só.
+    # Os tempos já voltam na linha do tempo do áudio original, mesmo com o VAD.
+    parts = [(seg.start, seg.end, seg.text.strip()) for seg in segments]
+    return " ".join(text for _, _, text in parts), parts
 
 
-def transcribe_openai(path: str, prompt: str | None) -> str:
+def transcribe_openai(path: str, prompt: str | None) -> tuple[str, list[captions.Segment]]:
     if not OPENAI_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -356,6 +369,7 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
                 "model": OPENAI_MODEL,
                 "language": "pt",
                 "prompt": prompt or DEFAULT_PROMPT,
+                "response_format": "verbose_json" if OPENAI_TIMED else "json",
             },
             files={"file": (os.path.basename(path), f, "audio/mpeg")},
             timeout=600,
@@ -367,8 +381,13 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
             detail=f"OpenAI recusou ({resp.status_code}): {resp.text[:500]}",
         )
     try:
-        return resp.json()["text"].strip()
-    except (ValueError, KeyError) as e:
+        body = resp.json()
+        segments = [
+            (float(s["start"]), float(s["end"]), s["text"].strip())
+            for s in body.get("segments") or []
+        ]
+        return body["text"].strip(), segments
+    except (ValueError, KeyError, TypeError) as e:
         log.error("Resposta inesperada da OpenAI: %s", resp.text[:2000])
         raise HTTPException(
             status_code=502,
@@ -378,7 +397,9 @@ def transcribe_openai(path: str, prompt: str | None) -> str:
 
 def run_transcription(
     file_id: str, prompt: str | None, tag: str = "sync", ctx: dict | None = None
-) -> str:
+) -> tuple[str, str | None]:
+    """Devolve (texto corrido, legenda WebVTT). A legenda é None quando o motor
+    não devolve os tempos ou quando o áudio veio mudo."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         video_path = tmp.name
     audio_path = None
@@ -393,17 +414,21 @@ def run_transcription(
             log.info("%s | áudio: %.1f MB", tag, os.path.getsize(audio_path) / MB)
 
         with timed(f"transcrição ({engine})", tag, ctx):
-            text = (
+            text, segments = (
                 transcribe_openai(audio_path, prompt)
                 if USE_OPENAI
                 else transcribe_local(audio_path, prompt)
             )
-        log.info("%s | texto com %d caracteres", tag, len(text))
+        vtt = captions.build_vtt(segments)
+        log.info(
+            "%s | texto com %d caracteres, legenda %s",
+            tag, len(text), f"com {len(segments)} trechos" if vtt else "AUSENTE",
+        )
         if not text.strip():
             # O moovi_class trata texto vazio como falha; sem este aviso o log
             # mostraria "ok" e a aula apareceria FAILED sem explicação.
             log.warning("%s | transcrição VAZIA (áudio mudo?)", tag)
-        return text
+        return text, vtt
     finally:
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
@@ -413,15 +438,17 @@ def run_transcription(
 
 @app.post("/transcribe")
 def transcribe(body: Body):
-    return {"text": run_transcription(body.file_id, body.prompt)}
+    text, vtt = run_transcription(body.file_id, body.prompt)
+    return {"text": text, "vtt": vtt}
 
 
 def process_and_callback(file_id: str, prompt: str | None, lesson_id: str):
     """Transcreve em background e devolve o resultado pro moovi_class via POST.
 
     Roda DEPOIS da resposta 202 — a transcrição pode levar minutos sem prender
-    nenhuma requisição. Sucesso envia {lesson_id, text}; falha envia
-    {lesson_id, error}. O moovi_class persiste o texto e atualiza o status.
+    nenhuma requisição. Sucesso envia {lesson_id, text, vtt} (vtt pode ser
+    null); falha envia {lesson_id, error}. O moovi_class persiste o texto e a
+    legenda e atualiza o status.
     O destino é a CALLBACK_URL fixa do serviço (não vem da request).
     """
     tag = f"lesson={lesson_id}"
@@ -430,8 +457,8 @@ def process_and_callback(file_id: str, prompt: str | None, lesson_id: str):
     log.info("%s | JOB INICIADO (file_id=%s)", tag, file_id)
 
     try:
-        text = run_transcription(file_id, prompt, tag, ctx)
-        payload = {"lesson_id": lesson_id, "text": text}
+        text, vtt = run_transcription(file_id, prompt, tag, ctx)
+        payload = {"lesson_id": lesson_id, "text": text, "vtt": vtt}
         log.info(
             "%s | JOB OK em %.1fs (%d caracteres)",
             tag, time.monotonic() - started, len(text),
