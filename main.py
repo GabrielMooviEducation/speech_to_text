@@ -470,25 +470,54 @@ def process_and_callback(file_id: str, prompt: str | None, lesson_id: str):
         log.error("%s | JOB FALHOU em %.1fs: %s", tag, time.monotonic() - started, message)
         payload = {"lesson_id": lesson_id, "error": message[:500]}
 
+    if deliver_callback(payload, tag):
+        return
+    # O resultado não chegou ao Class: sem isto a aula ficaria em PROCESSING pra
+    # sempre, com o botão de refazer travado na tela.
+    if db.fail_lesson_transcript(lesson_id):
+        log.error("%s | aula marcada FAILED direto no banco (callback não chegou)", tag)
+    else:
+        log.error("%s | callback não chegou e o banco também não foi atualizado", tag)
+
+
+# Espera (s) antes de cada nova tentativa do callback: ~5 min no total. Cobre o
+# Class fora do ar num deploy ou reinício, que antes custava a transcrição já
+# paga e deixava a aula presa.
+CALLBACK_RETRY_DELAYS = (10, 30, 90, 180)
+
+
+def deliver_callback(payload: dict, tag: str) -> bool:
+    """Entrega o resultado no Class, tentando de novo enquanto o erro for de rede
+    ou 5xx. Devolve se o Class aceitou."""
     headers = {"Content-Type": "application/json"}
     if CALLBACK_SECRET:
         headers["X-Callback-Secret"] = CALLBACK_SECRET
-    try:
-        resp = requests.post(CALLBACK_URL, json=payload, headers=headers, timeout=30)
-        if resp.status_code >= 300:
-            # 401 aqui = secret divergente entre os dois serviços; a aula fica
-            # em PROCESSING pra sempre e nada aparece na tela do professor.
+    for attempt, delay in enumerate((0, *CALLBACK_RETRY_DELAYS), start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = requests.post(CALLBACK_URL, json=payload, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            log.warning(
+                "%s | callback inalcançável (%s), tentativa %d: %s",
+                tag, CALLBACK_URL, attempt, describe_error(e),
+            )
+            continue
+        if resp.status_code < 300:
+            log.info("%s | callback entregue (%s)", tag, resp.status_code)
+            return True
+        if resp.status_code < 500:
+            # 4xx não melhora repetindo: 401 = secret divergente entre os dois
+            # serviços, 404 = a aula foi apagada.
             log.error(
                 "%s | callback recusado (%s): %s", tag, resp.status_code, resp.text[:500]
             )
-        else:
-            log.info("%s | callback entregue (%s)", tag, resp.status_code)
-    except requests.RequestException as e:
-        # callback inalcançável: o moovi_class fica em PROCESSING (reprocessável)
-        log.error(
-            "%s | callback inalcançável (%s): %s — a aula fica em PROCESSING",
-            tag, CALLBACK_URL, describe_error(e),
+            return False
+        log.warning(
+            "%s | callback respondeu %s, tentativa %d: %s",
+            tag, resp.status_code, attempt, resp.text[:300],
         )
+    return False
 
 
 # --- Remux (conserta a barra de progresso dos vídeos exportados) ----------

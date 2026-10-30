@@ -1,8 +1,10 @@
-"""Acesso ao banco do moovi_class (MySQL) — SOMENTE as colunas de export.
+"""Acesso ao banco do moovi_class (MySQL) — SOMENTE colunas de estado de job.
 
 O render roda aqui, mas quem manda na gravação é o Class: este módulo escreve
-apenas `recordings.export_*`, nunca cria linha, nunca altera schema. O Class
-continua sendo o dono do modelo (Prisma) e de qualquer DDL.
+apenas `recordings.export_*` e, como último recurso quando o callback da
+transcrição não chega, `lessons.transcript_status`. Nunca cria linha, nunca
+altera schema. O Class continua sendo o dono do modelo (Prisma) e de qualquer
+DDL.
 
 Conexão curta por operação, de propósito: o progresso é escrito de poucos em
 poucos por cento, e uma conexão ociosa presa num servidor remoto morre sozinha
@@ -113,6 +115,29 @@ def update_export(
             cur.execute(sql, args)
     except Exception as e:  # noqa: BLE001
         log.warning("db | falha ao gravar export de %s: %s", recording_id, e)
+
+
+def fail_lesson_transcript(lesson_id: str) -> bool:
+    """Tira a aula de PROCESSING quando o callback não chegou ao Class.
+
+    Sem isto a aula ficava presa em "Processando" e o botão de refazer travado.
+    Mesmo efeito do `failLessonTranscript` do Class: só rebaixa quem ainda está
+    PROCESSING, então um job mais novo que já gravou DONE não é atropelado.
+    Devolve se alguma linha mudou; erro aqui é logado, não lançado.
+    """
+    try:
+        with _cursor() as cur:
+            if cur is None:
+                return False
+            changed = cur.execute(
+                "UPDATE lessons SET transcript_status = 'FAILED', updated_at = %s "
+                "WHERE id = %s AND transcript_status = 'PROCESSING'",
+                (datetime.now(timezone.utc).replace(tzinfo=None), lesson_id),
+            )
+            return changed > 0
+    except Exception as e:  # noqa: BLE001
+        log.warning("db | falha ao marcar transcrição FAILED de %s: %s", lesson_id, e)
+        return False
 
 
 def export_cancelled(recording_id: str) -> bool:
