@@ -203,6 +203,19 @@ DEFAULT_PROMPT = os.getenv(
     "Transcrição de um vídeo em português do Brasil.",
 )
 
+# Idiomas aceitos pela transcrição por URL. O padrão de tudo continua "pt" (o
+# fluxo do Drive, usado pelo moovi_class, não muda).
+LANGUAGES = ("pt", "en", "es")
+LANGUAGE_PROMPTS = {
+    "pt": DEFAULT_PROMPT,
+    "en": "Transcript of a video in English.",
+    "es": "Transcripción de un video en español.",
+}
+
+
+def default_prompt(language: str) -> str:
+    return LANGUAGE_PROMPTS.get(language, DEFAULT_PROMPT)
+
 
 def _ffmpeg_version() -> str:
     """Confere na subida se o ffmpeg existe — sem ele TODA transcrição falha, e
@@ -331,12 +344,14 @@ def extract_audio(video_path: str) -> str:
     return audio_path
 
 
-def transcribe_local(path: str, prompt: str | None) -> tuple[str, list[captions.Segment]]:
+def transcribe_local(
+    path: str, prompt: str | None, language: str = "pt"
+) -> tuple[str, list[captions.Segment]]:
     segments, _ = get_local_model().transcribe(
         path,
-        language="pt",
+        language=language,
         vad_filter=True,
-        initial_prompt=prompt or DEFAULT_PROMPT,
+        initial_prompt=prompt or default_prompt(language),
     )
     # `segments` é um gerador: a transcrição acontece ao percorrê-lo, uma vez só.
     # Os tempos já voltam na linha do tempo do áudio original, mesmo com o VAD.
@@ -344,7 +359,9 @@ def transcribe_local(path: str, prompt: str | None) -> tuple[str, list[captions.
     return " ".join(text for _, _, text in parts), parts
 
 
-def transcribe_openai(path: str, prompt: str | None) -> tuple[str, list[captions.Segment]]:
+def transcribe_openai(
+    path: str, prompt: str | None, language: str = "pt"
+) -> tuple[str, list[captions.Segment]]:
     if not OPENAI_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -367,8 +384,8 @@ def transcribe_openai(path: str, prompt: str | None) -> tuple[str, list[captions
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             data={
                 "model": OPENAI_MODEL,
-                "language": "pt",
-                "prompt": prompt or DEFAULT_PROMPT,
+                "language": language,
+                "prompt": prompt or default_prompt(language),
                 "response_format": "verbose_json" if OPENAI_TIMED else "json",
             },
             files={"file": (os.path.basename(path), f, "audio/mpeg")},
@@ -1065,3 +1082,144 @@ def transcribe_async(body: AsyncBody, background: BackgroundTasks):
         body.lesson_id,
     )
     return {"accepted": True}
+
+
+# --- Transcrição por URL (Moovi Marketing e outros) -------------------------
+# Para quem tem o vídeo numa URL (MinIO) em vez do Google Drive. O chamador
+# escolhe o idioma, consulta o estado por polling (ver url_jobs.py) e recebe
+# texto, legenda .vtt e os trechos com tempo. NÃO mexe no fluxo do Drive nem
+# no banco do moovi_class.
+#
+# Exige chave (X-Api-Key = SPEECH_API_KEY): transcrever qualquer URL gasta a
+# conta da OpenAI, então sem chave configurada estas rotas ficam desligadas.
+
+import hmac  # noqa: E402
+
+from url_jobs import TranscribeJobs  # noqa: E402
+
+SPEECH_API_KEY = os.getenv("SPEECH_API_KEY", "").strip()
+URL_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{8,100}$")
+
+
+def _require_api_key(request: Request) -> None:
+    if not SPEECH_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="SPEECH_API_KEY não configurada: transcrição por URL desligada.",
+        )
+    sent = request.headers.get("x-api-key", "")
+    if not hmac.compare_digest(sent.encode(), SPEECH_API_KEY.encode()):
+        raise HTTPException(status_code=401, detail="Chave de API inválida.")
+
+
+def extract_audio_url(url: str, audio_path: str) -> None:
+    """Extrai o áudio (mono/16kHz/MP3) lendo o vídeo direto da URL, sem baixar
+    o arquivo inteiro para o disco. Reconecta se a conexão cair no meio."""
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-y",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-i", url,
+            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+            audio_path,
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        log.error("ffmpeg (extract_audio_url) saiu %s. stderr:\n%s", proc.returncode, stderr[-4000:])
+        raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-500:]}")
+
+
+def _run_url_transcription(params: dict, set_phase) -> dict:
+    tag = f"url-job={params['job_id']}"
+    ctx = {"step": "início"}
+    started = time.monotonic()
+    engine = f"openai/{OPENAI_MODEL}" if USE_OPENAI else "local/large-v3"
+    language = params["language"]
+    log.info("%s | JOB INICIADO (idioma=%s, motor=%s)", tag, language, engine)
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        audio_path = tmp.name
+    try:
+        set_phase("audio")
+        with timed("extração de áudio da URL (ffmpeg)", tag, ctx):
+            extract_audio_url(params["url"], audio_path)
+            log.info("%s | áudio: %.1f MB", tag, os.path.getsize(audio_path) / MB)
+
+        set_phase("transcribing")
+        with timed(f"transcrição ({engine})", tag, ctx):
+            text, segments = (
+                transcribe_openai(audio_path, params["prompt"], language)
+                if USE_OPENAI
+                else transcribe_local(audio_path, params["prompt"], language)
+            )
+        vtt = captions.build_vtt(segments)
+        log.info(
+            "%s | JOB OK em %.1fs (%d caracteres, %d trechos)",
+            tag, time.monotonic() - started, len(text), len(segments),
+        )
+        return {
+            "text": text,
+            "vtt": vtt,
+            "segments": [[round(a, 3), round(b, 3), t] for a, b, t in segments],
+            "language": language,
+            "engine": engine,
+        }
+    except Exception as e:  # noqa: BLE001
+        # A etapa vai junto na mensagem, como no fluxo do Drive.
+        message = f"[{ctx['step']}] {describe_error(e)}"
+        log.error("%s | JOB FALHOU em %.1fs: %s", tag, time.monotonic() - started, message)
+        raise RuntimeError(message) from e
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+
+url_jobs = TranscribeJobs(
+    _run_url_transcription,
+    concurrency=max(1, int(os.getenv("URL_TRANSCRIBE_CONCURRENCY", "1") or 1)),
+    max_queue=max(1, int(os.getenv("URL_TRANSCRIBE_QUEUE_MAX", "32") or 32)),
+)
+url_jobs.start()
+log.info(
+    "transcrição por URL=%s",
+    "LIGADA" if SPEECH_API_KEY else "DESLIGADA (SPEECH_API_KEY ausente)",
+)
+
+
+class UrlTranscribeBody(BaseModel):
+    # Id escolhido pelo chamador: pedir de novo com o mesmo id devolve o mesmo
+    # job (não transcreve duas vezes). Para refazer, use um id novo.
+    job_id: str
+    url: str
+    language: str = "pt"
+    prompt: str | None = None
+
+
+@app.post("/transcribe-url-async", status_code=202)
+def transcribe_url_async(body: UrlTranscribeBody, request: Request):
+    _require_api_key(request)
+    if not URL_JOB_ID.match(body.job_id):
+        raise HTTPException(status_code=400, detail="job_id inválido.")
+    if not _is_safe_url(body.url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
+    if body.language not in LANGUAGES:
+        raise HTTPException(status_code=400, detail=f"Idioma não suportado: {body.language}.")
+    prompt = (body.prompt or "").strip()[:800] or None
+    state = url_jobs.submit(
+        body.job_id,
+        {"job_id": body.job_id, "url": body.url, "language": body.language, "prompt": prompt},
+    )
+    if state is None:
+        raise HTTPException(status_code=503, detail="Fila de transcrição cheia. Tente em instantes.")
+    log.info("url-job=%s | %s (fila=%d)", body.job_id, state["status"], url_jobs.pending())
+    return state
+
+
+@app.get("/transcribe-url-async/{job_id}")
+def transcribe_url_status(job_id: str, request: Request):
+    _require_api_key(request)
+    state = url_jobs.get(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job não encontrado (expirou ou o serviço reiniciou).")
+    return state
