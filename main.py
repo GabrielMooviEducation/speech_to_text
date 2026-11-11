@@ -345,22 +345,37 @@ def extract_audio(video_path: str) -> str:
 
 
 def transcribe_local(
-    path: str, prompt: str | None, language: str = "pt"
+    path: str,
+    prompt: str | None,
+    language: str = "pt",
+    words_out: list[captions.Segment] | None = None,
 ) -> tuple[str, list[captions.Segment]]:
+    """`words_out` (opcional) recebe o tempo de cada palavra: quem edita vídeo
+    (Moovi Marketing) usa para a legenda palavra a palavra e o corte de silêncio."""
     segments, _ = get_local_model().transcribe(
         path,
         language=language,
         vad_filter=True,
         initial_prompt=prompt or default_prompt(language),
+        word_timestamps=words_out is not None,
     )
     # `segments` é um gerador: a transcrição acontece ao percorrê-lo, uma vez só.
     # Os tempos já voltam na linha do tempo do áudio original, mesmo com o VAD.
-    parts = [(seg.start, seg.end, seg.text.strip()) for seg in segments]
+    parts = []
+    for seg in segments:
+        parts.append((seg.start, seg.end, seg.text.strip()))
+        if words_out is not None:
+            for w in seg.words or []:
+                if w.word.strip():
+                    words_out.append((w.start, w.end, w.word.strip()))
     return " ".join(text for _, _, text in parts), parts
 
 
 def transcribe_openai(
-    path: str, prompt: str | None, language: str = "pt"
+    path: str,
+    prompt: str | None,
+    language: str = "pt",
+    words_out: list[captions.Segment] | None = None,
 ) -> tuple[str, list[captions.Segment]]:
     if not OPENAI_API_KEY:
         raise HTTPException(
@@ -378,16 +393,21 @@ def transcribe_openai(
                 "OpenAI. Use o motor local (USE_OPENAI=false) para esta aula."
             ),
         )
+    data: dict = {
+        "model": OPENAI_MODEL,
+        "language": language,
+        "prompt": prompt or default_prompt(language),
+        "response_format": "verbose_json" if OPENAI_TIMED else "json",
+    }
+    want_words = words_out is not None and OPENAI_TIMED
+    if want_words:
+        # Pedir "word" sozinho tira os trechos da resposta: os dois juntos.
+        data["timestamp_granularities[]"] = ["word", "segment"]
     with open(path, "rb") as f:
         resp = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            data={
-                "model": OPENAI_MODEL,
-                "language": language,
-                "prompt": prompt or default_prompt(language),
-                "response_format": "verbose_json" if OPENAI_TIMED else "json",
-            },
+            data=data,
             files={"file": (os.path.basename(path), f, "audio/mpeg")},
             timeout=600,
         )
@@ -403,6 +423,12 @@ def transcribe_openai(
             (float(s["start"]), float(s["end"]), s["text"].strip())
             for s in body.get("segments") or []
         ]
+        if want_words and words_out is not None:
+            words_out.extend(
+                (float(w["start"]), float(w["end"]), w["word"].strip())
+                for w in body.get("words") or []
+                if str(w.get("word", "")).strip()
+            )
         return body["text"].strip(), segments
     except (ValueError, KeyError, TypeError) as e:
         log.error("Resposta inesperada da OpenAI: %s", resp.text[:2000])
@@ -1147,24 +1173,29 @@ def _run_url_transcription(params: dict, set_phase) -> dict:
             log.info("%s | áudio: %.1f MB", tag, os.path.getsize(audio_path) / MB)
 
         set_phase("transcribing")
+        words: list[captions.Segment] | None = [] if params.get("words") else None
         with timed(f"transcrição ({engine})", tag, ctx):
             text, segments = (
-                transcribe_openai(audio_path, params["prompt"], language)
+                transcribe_openai(audio_path, params["prompt"], language, words)
                 if USE_OPENAI
-                else transcribe_local(audio_path, params["prompt"], language)
+                else transcribe_local(audio_path, params["prompt"], language, words)
             )
         vtt = captions.build_vtt(segments)
         log.info(
-            "%s | JOB OK em %.1fs (%d caracteres, %d trechos)",
+            "%s | JOB OK em %.1fs (%d caracteres, %d trechos, %s palavras com tempo)",
             tag, time.monotonic() - started, len(text), len(segments),
+            len(words) if words is not None else "sem",
         )
-        return {
+        result = {
             "text": text,
             "vtt": vtt,
             "segments": [[round(a, 3), round(b, 3), t] for a, b, t in segments],
             "language": language,
             "engine": engine,
         }
+        if words is not None:
+            result["words"] = [[round(a, 3), round(b, 3), w] for a, b, w in words]
+        return result
     except Exception as e:  # noqa: BLE001
         # A etapa vai junto na mensagem, como no fluxo do Drive.
         message = f"[{ctx['step']}] {describe_error(e)}"
@@ -1194,6 +1225,9 @@ class UrlTranscribeBody(BaseModel):
     url: str
     language: str = "pt"
     prompt: str | None = None
+    # Tempo de cada palavra no resultado ("words"): legenda palavra a palavra e
+    # corte de silêncio na edição de vídeo. Desligado, a resposta não muda.
+    words: bool = False
 
 
 @app.post("/transcribe-url-async", status_code=202)
@@ -1208,7 +1242,13 @@ def transcribe_url_async(body: UrlTranscribeBody, request: Request):
     prompt = (body.prompt or "").strip()[:800] or None
     state = url_jobs.submit(
         body.job_id,
-        {"job_id": body.job_id, "url": body.url, "language": body.language, "prompt": prompt},
+        {
+            "job_id": body.job_id,
+            "url": body.url,
+            "language": body.language,
+            "prompt": prompt,
+            "words": body.words,
+        },
     )
     if state is None:
         raise HTTPException(status_code=503, detail="Fila de transcrição cheia. Tente em instantes.")
