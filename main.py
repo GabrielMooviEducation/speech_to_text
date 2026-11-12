@@ -1157,6 +1157,84 @@ def extract_audio_url(url: str, audio_path: str) -> None:
         raise HTTPException(status_code=500, detail=f"ffmpeg falhou: {stderr[-500:]}")
 
 
+# --- Mapa de silêncio do áudio (edição de vídeo do Moovi Marketing) ---------
+# O tempo das palavras do Whisper erra nas pontas (a palavra começa antes e
+# termina depois do que ele marca) e às vezes some com hesitações e finais de
+# frase baixos. Quem corta silêncio só pelas palavras acaba cortando voz. Este
+# mapa diz onde o áudio está DE FATO quieto; o Marketing só corta onde não há
+# palavra E há silêncio aqui.
+
+# Silêncio = tanto dB abaixo do volume médio da gravação (o médio já inclui as
+# pausas, então a fala fica acima dele). Limites protegem gravação muito alta
+# ou muito baixa.
+SILENCE_BELOW_MEAN_DB = 14.0
+SILENCE_MIN_DB = -60.0
+SILENCE_MAX_DB = -28.0
+# Pausa mais curta que isso não interessa a quem corta silêncio.
+SILENCE_MIN_SECONDS = 0.2
+
+_MEAN_VOLUME = re.compile(r"mean_volume:\s*(-?[\d.]+)\s*dB")
+_SILENCE_START = re.compile(r"silence_start:\s*(-?[\d.]+)")
+_SILENCE_END = re.compile(r"silence_end:\s*(-?[\d.]+)")
+_DURATION = re.compile(r"Duration:\s*(\d+):(\d+):([\d.]+)")
+
+
+def silence_threshold_db(mean_db: float | None) -> float:
+    """Limiar do silencedetect a partir do volume médio da gravação."""
+    if mean_db is None:
+        return -40.0
+    return max(SILENCE_MIN_DB, min(SILENCE_MAX_DB, mean_db - SILENCE_BELOW_MEAN_DB))
+
+
+def parse_silences(stderr: str, duration: float | None = None) -> list[tuple[float, float]]:
+    """Intervalos (início, fim) da saída do silencedetect. Um silêncio que vai
+    até o fim do arquivo não tem silence_end: fecha na duração, se souber."""
+    out: list[tuple[float, float]] = []
+    start: float | None = None
+    for line in stderr.splitlines():
+        m = _SILENCE_START.search(line)
+        if m:
+            start = max(0.0, float(m.group(1)))
+            continue
+        m = _SILENCE_END.search(line)
+        if m and start is not None:
+            end = float(m.group(1))
+            if end > start:
+                out.append((start, end))
+            start = None
+    if start is not None and duration and duration > start:
+        out.append((start, duration))
+    return out
+
+
+def detect_silences(audio_path: str, duration: float | None = None) -> list[tuple[float, float]]:
+    """Duas passadas rápidas no áudio já extraído (16 kHz mono): volume médio
+    e, com o limiar relativo a ele, os trechos em silêncio."""
+    vol = subprocess.run(
+        ["ffmpeg", "-nostdin", "-i", audio_path, "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True,
+    )
+    info = vol.stderr.decode("utf-8", "ignore")
+    m = _MEAN_VOLUME.search(info)
+    noise = silence_threshold_db(float(m.group(1)) if m else None)
+    if duration is None:
+        d = _DURATION.search(info)
+        if d:
+            duration = int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-i", audio_path,
+            "-af", f"silencedetect=noise={noise:.1f}dB:d={SILENCE_MIN_SECONDS}",
+            "-f", "null", "-",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        log.warning("silencedetect saiu %s; seguindo sem mapa de silêncio", proc.returncode)
+        return []
+    return parse_silences(proc.stderr.decode("utf-8", "ignore"), duration)
+
+
 def _run_url_transcription(params: dict, set_phase) -> dict:
     tag = f"url-job={params['job_id']}"
     ctx = {"step": "início"}
@@ -1195,6 +1273,15 @@ def _run_url_transcription(params: dict, set_phase) -> dict:
         }
         if words is not None:
             result["words"] = [[round(a, 3), round(b, 3), w] for a, b, w in words]
+            # Quem pede palavras edita vídeo: vai junto o mapa de silêncio do
+            # áudio (falhar aqui não derruba a transcrição).
+            try:
+                with timed("mapa de silêncio (ffmpeg)", tag, ctx):
+                    silences = detect_silences(audio_path)
+                result["silences"] = [[round(a, 3), round(b, 3)] for a, b in silences]
+                log.info("%s | %d trechos de silêncio", tag, len(silences))
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s | sem mapa de silêncio: %s", tag, describe_error(e))
         return result
     except Exception as e:  # noqa: BLE001
         # A etapa vai junto na mensagem, como no fluxo do Drive.
