@@ -1235,6 +1235,74 @@ def detect_silences(audio_path: str, duration: float | None = None) -> list[tupl
     return parse_silences(proc.stderr.decode("utf-8", "ignore"), duration)
 
 
+# --- Mapa de movimento da imagem (edição de vídeo do Moovi Marketing) -------
+# Quem grava se levantando, sentando ou mudando de lugar entre uma fala e
+# outra: a folga que o corte deixa em volta da fala (para não comer a voz)
+# pegava esse movimento. Este mapa diz, a cada 0,1 s, quanto a imagem mudou;
+# o Marketing encurta a folga e corta a pausa onde a pessoa está se mexendo.
+
+MOTION_FPS = 10
+_META_PTS = re.compile(r"pts_time:\s*(-?[\d.]+)")
+_META_YAVG = re.compile(r"lavfi\.signalstats\.YAVG=(-?[\d.]+)")
+
+
+def parse_motion(stderr: str, fps: int = MOTION_FPS) -> list[float]:
+    """Diferença média entre quadros seguidos (0 a 255, imagem em cinza),
+    normalizada para quadros de 30 fps e agrupada em blocos de 1/fps s. Bloco
+    sem quadro repete o anterior."""
+    frames: list[tuple[float, float]] = []
+    pts: float | None = None
+    for line in stderr.splitlines():
+        m = _META_PTS.search(line)
+        if m:
+            pts = float(m.group(1))
+            continue
+        m = _META_YAVG.search(line)
+        if m and pts is not None:
+            frames.append((pts, float(m.group(1))))
+            pts = None
+    if not frames:
+        return []
+    sums: dict[int, list[float]] = {}
+    prev_t: float | None = None
+    for t, y in frames:
+        dt = (t - prev_t) if prev_t is not None and t > prev_t else 1 / 30
+        prev_t = t
+        k = int(max(0.0, t) * fps)
+        acc = sums.setdefault(k, [0.0, 0])
+        acc[0] += y / max(1.0, dt * 30)
+        acc[1] += 1
+    values: list[float] = []
+    last = 0.0
+    for k in range(max(sums) + 1):
+        if k in sums:
+            last = sums[k][0] / sums[k][1]
+        values.append(round(last, 1))
+    return values
+
+
+def detect_motion(url: str) -> list[float]:
+    """Uma passada no vídeo da URL, reduzido a 64 px de largura e em cinza.
+    Duas threads só: roda depois da transcrição e não pode pesar na máquina."""
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-threads", "2",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-i", url,
+            "-an", "-sn", "-dn",
+            "-vf",
+            "scale=64:-2:flags=area,format=gray,tblend=all_mode=difference,"
+            "signalstats,metadata=mode=print:key=lavfi.signalstats.YAVG",
+            "-f", "null", "-",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        log.warning("mapa de movimento: ffmpeg saiu %s", proc.returncode)
+        return []
+    return parse_motion(proc.stderr.decode("utf-8", "ignore"))
+
+
 def _run_url_transcription(params: dict, set_phase) -> dict:
     tag = f"url-job={params['job_id']}"
     ctx = {"step": "início"}
@@ -1282,6 +1350,15 @@ def _run_url_transcription(params: dict, set_phase) -> dict:
                 log.info("%s | %d trechos de silêncio", tag, len(silences))
             except Exception as e:  # noqa: BLE001
                 log.warning("%s | sem mapa de silêncio: %s", tag, describe_error(e))
+            # E o mapa de movimento da imagem (levantar, sentar, mudar de lugar).
+            try:
+                with timed("mapa de movimento (ffmpeg)", tag, ctx):
+                    motion = detect_motion(params["url"])
+                if motion:
+                    result["motion"] = {"fps": MOTION_FPS, "values": motion}
+                log.info("%s | movimento: %d blocos", tag, len(motion))
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s | sem mapa de movimento: %s", tag, describe_error(e))
         return result
     except Exception as e:  # noqa: BLE001
         # A etapa vai junto na mensagem, como no fluxo do Drive.
