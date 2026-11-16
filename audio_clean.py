@@ -14,9 +14,11 @@ medição do áudio, e cada filtro só entra se a medição pedir:
 6. loudnorm em 2 passadas: -14 LUFS, pico máximo de -1,5 dBTP (o padrão de
    YouTube, Instagram e LinkedIn).
 
-O resultado (AAC em .m4a, mesmo relógio do vídeo de origem) vai por PUT direto
-no MinIO, na URL assinada de quem pediu. A resposta traz a medição e o que foi
-aplicado, para a tela explicar.
+O resultado vai por PUT direto no MinIO, nas URLs assinadas de quem pediu: o
+áudio tratado (AAC em .m4a, mesmo relógio do vídeo de origem) e, se pedido, o
+próprio vídeo com o áudio trocado (imagem copiada sem reencode, MP4). Esse
+vídeo vira o vídeo do post: transcrição, cortes, edição e render leem ele. A
+resposta traz a medição e o que foi aplicado, para a tela explicar.
 
 As funções de leitura da saída do ffmpeg (parse_*) e o plano da cadeia
 (plan_chain) não dependem de ffmpeg: dá para testar com Python puro.
@@ -279,7 +281,7 @@ def _loudnorm(measured: dict[str, float] | None = None) -> str:
 
 
 def _ffmpeg(args: list[str]) -> str:
-    proc = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", *args], capture_output=True)
+    proc = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-y", *args], capture_output=True)
     stderr = proc.stderr.decode("utf-8", "ignore")
     if proc.returncode != 0:
         if "does not contain any stream" in stderr or "matches no streams" in stderr:
@@ -313,18 +315,29 @@ def clean(
     out_path: str,
     noise_mode: str = "auto",
     set_phase: Callable[[str], None] = lambda _p: None,
+    video_out: str | None = None,
 ) -> dict:
-    """Extrai o áudio da URL, mede, trata e grava o .m4a em `out_path`."""
+    """Extrai o áudio da URL, mede, trata e grava o .m4a em `out_path`. Com
+    `video_out`, grava também o vídeo da URL com o áudio tratado no lugar."""
     if noise_mode not in NOISE_MODES:
         noise_mode = "auto"
     workdir = tempfile.mkdtemp(prefix="audio-clean-")
     try:
         src = os.path.join(workdir, "src.flac")
+        picture = os.path.join(workdir, "picture.mp4")
         set_phase("audio")
+        # Uma leitura só da URL: o áudio para tratar e (se pedido) a imagem
+        # copiada como está, para montar o vídeo no fim.
         _ffmpeg(
             [
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-i", url, "-vn", "-sn", "-dn", "-c:a", "flac", "-ar", "48000", "-y", src,
+                "-i", url,
+                "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "flac", "-ar", "48000", src,
+                *(
+                    ["-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "copy", picture]
+                    if video_out
+                    else []
+                ),
             ]
         )
 
@@ -343,10 +356,20 @@ def clean(
             [
                 "-i", src, "-af", ",".join([*chain, _loudnorm(first), "aresample=48000"]),
                 "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart",
-                "-y", out_path,
+                out_path,
             ]
         )
         after = parse_loudnorm(final) or {}
+
+        if video_out:
+            set_phase("video")
+            _ffmpeg(
+                [
+                    "-i", picture, "-i", out_path,
+                    "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-movflags", "+faststart",
+                    video_out,
+                ]
+            )
         return {
             "noise_mode": noise_mode,
             "analysis": analysis,
@@ -358,28 +381,39 @@ def clean(
                 "linear": bool(after.get("linear")),
                 "size": os.path.getsize(out_path),
             },
+            **({"video": {"size": os.path.getsize(video_out)}} if video_out else {}),
         }
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _put(url: str, path: str, content_type: str, what: str, tag: str) -> None:
+    with open(path, "rb") as f:  # streaming (não carrega tudo na RAM)
+        put = requests.put(url, data=f, headers={"Content-Type": content_type}, timeout=3600)
+    if put.status_code not in (200, 204):
+        log.error("%s | PUT do %s falhou (%s): %s", tag, what, put.status_code, put.text[:500])
+        raise RuntimeError(f"Não foi possível gravar o {what} (PUT {put.status_code}).")
+
+
 def run(params: dict, set_phase: Callable[[str], None]) -> dict:
-    """Job da fila (url_jobs): trata e faz o PUT do .m4a na URL assinada."""
+    """Job da fila (url_jobs): trata e faz o PUT do .m4a (e do vídeo com o
+    áudio tratado, se veio `video_upload_url`) nas URLs assinadas."""
     tag = f"audio-job={params['job_id']}"
     started = time.monotonic()
-    log.info("%s | INICIADO (ruído=%s)", tag, params.get("noise", "auto"))
+    want_video = bool(params.get("video_upload_url"))
+    log.info("%s | INICIADO (ruído=%s, vídeo=%s)", tag, params.get("noise", "auto"), want_video)
     fd, out_path = tempfile.mkstemp(suffix=".m4a")
     os.close(fd)
+    video_path: str | None = None
+    if want_video:
+        fd, video_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
     try:
-        result = clean(params["url"], out_path, params.get("noise", "auto"), set_phase)
+        result = clean(params["url"], out_path, params.get("noise", "auto"), set_phase, video_path)
         set_phase("uploading")
-        with open(out_path, "rb") as f:
-            put = requests.put(
-                params["upload_url"], data=f, headers={"Content-Type": "audio/mp4"}, timeout=1800
-            )
-        if put.status_code not in (200, 204):
-            log.error("%s | PUT no MinIO falhou (%s): %s", tag, put.status_code, put.text[:500])
-            raise RuntimeError(f"Não foi possível gravar o áudio tratado (PUT {put.status_code}).")
+        _put(params["upload_url"], out_path, "audio/mp4", "áudio tratado", tag)
+        if video_path:
+            _put(params["video_upload_url"], video_path, "video/mp4", "vídeo com o áudio tratado", tag)
         steps = ", ".join(s["key"] for s in result["steps"] if s["applied"])
         log.info(
             "%s | OK em %.1fs (snr=%s, lra=%s, filtros: %s)",
@@ -391,5 +425,6 @@ def run(params: dict, set_phase: Callable[[str], None]) -> dict:
         log.error("%s | FALHOU em %.1fs: %s", tag, time.monotonic() - started, e)
         raise
     finally:
-        if os.path.exists(out_path):
-            os.remove(out_path)
+        for path in (out_path, video_path):
+            if path and os.path.exists(path):
+                os.remove(path)

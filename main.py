@@ -1450,6 +1450,9 @@ class AudioCleanBody(BaseModel):
     job_id: str
     url: str
     upload_url: str
+    # Opcional: onde gravar o vídeo da `url` com o áudio tratado no lugar (MP4,
+    # imagem copiada sem reencode). É o vídeo que o post passa a usar.
+    video_upload_url: str | None = None
     # Redução de ruído: auto (pela medição), light, strong ou off.
     noise: str = "auto"
 
@@ -1461,11 +1464,19 @@ def clean_audio_async(body: AudioCleanBody, request: Request):
         raise HTTPException(status_code=400, detail="job_id inválido.")
     if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
         raise HTTPException(status_code=400, detail="URL não permitida.")
+    if body.video_upload_url and not _is_safe_url(body.video_upload_url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
     if body.noise not in audio_clean.NOISE_MODES:
         raise HTTPException(status_code=400, detail=f"Modo de ruído inválido: {body.noise}.")
     state = audio_jobs.submit(
         body.job_id,
-        {"job_id": body.job_id, "url": body.url, "upload_url": body.upload_url, "noise": body.noise},
+        {
+            "job_id": body.job_id,
+            "url": body.url,
+            "upload_url": body.upload_url,
+            "video_upload_url": body.video_upload_url,
+            "noise": body.noise,
+        },
     )
     if state is None:
         raise HTTPException(status_code=503, detail="Fila de tratamento cheia. Tente em instantes.")
