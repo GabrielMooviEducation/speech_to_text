@@ -1427,3 +1427,56 @@ def transcribe_url_status(job_id: str, request: Request):
     if state is None:
         raise HTTPException(status_code=404, detail="Job não encontrado (expirou ou o serviço reiniciou).")
     return state
+
+
+# --- Tratamento do áudio por URL (etapa do Moovi Marketing) -----------------
+# Mesmo desenho da transcrição por URL: o chamador escolhe o job_id, consulta
+# por polling e manda a URL assinada onde o .m4a tratado deve ser gravado.
+# A cadeia (medição + filtros) está em audio_clean.py.
+
+import audio_clean  # noqa: E402
+
+audio_jobs = TranscribeJobs(
+    audio_clean.run,
+    concurrency=max(1, int(os.getenv("AUDIO_CLEAN_CONCURRENCY", "1") or 1)),
+    max_queue=max(1, int(os.getenv("AUDIO_CLEAN_QUEUE_MAX", "16") or 16)),
+)
+audio_jobs.start()
+
+
+class AudioCleanBody(BaseModel):
+    # Id escolhido pelo chamador (pedir de novo com o mesmo id devolve o mesmo
+    # job). Para tratar de novo, use um id novo.
+    job_id: str
+    url: str
+    upload_url: str
+    # Redução de ruído: auto (pela medição), light, strong ou off.
+    noise: str = "auto"
+
+
+@app.post("/clean-audio-async", status_code=202)
+def clean_audio_async(body: AudioCleanBody, request: Request):
+    _require_api_key(request)
+    if not URL_JOB_ID.match(body.job_id):
+        raise HTTPException(status_code=400, detail="job_id inválido.")
+    if not _is_safe_url(body.url) or not _is_safe_url(body.upload_url):
+        raise HTTPException(status_code=400, detail="URL não permitida.")
+    if body.noise not in audio_clean.NOISE_MODES:
+        raise HTTPException(status_code=400, detail=f"Modo de ruído inválido: {body.noise}.")
+    state = audio_jobs.submit(
+        body.job_id,
+        {"job_id": body.job_id, "url": body.url, "upload_url": body.upload_url, "noise": body.noise},
+    )
+    if state is None:
+        raise HTTPException(status_code=503, detail="Fila de tratamento cheia. Tente em instantes.")
+    log.info("audio-job=%s | %s (fila=%d)", body.job_id, state["status"], audio_jobs.pending())
+    return state
+
+
+@app.get("/clean-audio-async/{job_id}")
+def clean_audio_status(job_id: str, request: Request):
+    _require_api_key(request)
+    state = audio_jobs.get(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job não encontrado (expirou ou o serviço reiniciou).")
+    return state
