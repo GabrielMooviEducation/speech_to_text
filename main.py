@@ -1359,6 +1359,18 @@ def _run_url_transcription(params: dict, set_phase) -> dict:
                 log.info("%s | movimento: %d blocos", tag, len(motion))
             except Exception as e:  # noqa: BLE001
                 log.warning("%s | sem mapa de movimento: %s", tag, describe_error(e))
+            # E a trilha do rosto (o recorte vertical segue a pessoa).
+            try:
+                import faces  # OpenCV só carrega aqui: sem ele, a transcrição segue
+
+                with timed("trilha do rosto (opencv)", tag, ctx):
+                    track = faces.detect_faces(params["url"])
+                if track:
+                    result["faces"] = track
+                found = sum(1 for x in (track or {}).get("x", []) if x is not None)
+                log.info("%s | rosto em %d de %d quadros", tag, found, len((track or {}).get("x", [])))
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s | sem trilha do rosto: %s", tag, describe_error(e))
         return result
     except Exception as e:  # noqa: BLE001
         # A etapa vai junto na mensagem, como no fluxo do Drive.

@@ -5,3 +5,5 @@ requests
 google-auth
 python-dotenv
 PyMySQL
+opencv-python-headless>=4.8,<5  # o Haar (CascadeClassifier) saiu do pacote na versão 5
+numpy
