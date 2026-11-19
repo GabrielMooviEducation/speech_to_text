@@ -1456,6 +1456,21 @@ audio_jobs = TranscribeJobs(
 audio_jobs.start()
 
 
+class UploadParts(BaseModel):
+    # Envio em partes (multipart do S3): uma URL assinada por parte, em ordem,
+    # todas com `part_size` bytes (a última pode ser menor). Vídeo grande num
+    # PUT só passa do tempo do proxy na frente do MinIO (o Traefik corta a
+    # requisição que leva mais de 60 s e devolve 499).
+    part_size: int
+    urls: list[str]
+
+
+# Limites do multipart do S3: parte de 5 MiB a 5 GiB, até 10 000 partes.
+PART_MIN = 5 * 1024 * 1024
+PART_MAX = 5 * 1024 * 1024 * 1024
+PARTS_MAX = 10_000
+
+
 class AudioCleanBody(BaseModel):
     # Id escolhido pelo chamador (pedir de novo com o mesmo id devolve o mesmo
     # job). Para tratar de novo, use um id novo.
@@ -1465,6 +1480,9 @@ class AudioCleanBody(BaseModel):
     # Opcional: onde gravar o vídeo da `url` com o áudio tratado no lugar (MP4,
     # imagem copiada sem reencode). É o vídeo que o post passa a usar.
     video_upload_url: str | None = None
+    # Opcional e preferido quando vem: o mesmo vídeo enviado em partes. As
+    # ETags voltam em result["video_parts"] para quem pediu fechar o upload.
+    video_upload_parts: UploadParts | None = None
     # Redução de ruído: auto (pela medição), light, strong ou off.
     noise: str = "auto"
 
@@ -1478,6 +1496,14 @@ def clean_audio_async(body: AudioCleanBody, request: Request):
         raise HTTPException(status_code=400, detail="URL não permitida.")
     if body.video_upload_url and not _is_safe_url(body.video_upload_url):
         raise HTTPException(status_code=400, detail="URL não permitida.")
+    parts = body.video_upload_parts
+    if parts is not None:
+        if not PART_MIN <= parts.part_size <= PART_MAX:
+            raise HTTPException(status_code=400, detail="Tamanho de parte inválido.")
+        if not 1 <= len(parts.urls) <= PARTS_MAX:
+            raise HTTPException(status_code=400, detail="Quantidade de partes inválida.")
+        if not all(_is_safe_url(u) for u in parts.urls):
+            raise HTTPException(status_code=400, detail="URL não permitida.")
     if body.noise not in audio_clean.NOISE_MODES:
         raise HTTPException(status_code=400, detail=f"Modo de ruído inválido: {body.noise}.")
     state = audio_jobs.submit(
@@ -1487,6 +1513,9 @@ def clean_audio_async(body: AudioCleanBody, request: Request):
             "url": body.url,
             "upload_url": body.upload_url,
             "video_upload_url": body.video_upload_url,
+            "video_upload_parts": (
+                {"part_size": parts.part_size, "urls": list(parts.urls)} if parts is not None else None
+            ),
             "noise": body.noise,
         },
     )

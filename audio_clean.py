@@ -395,12 +395,51 @@ def _put(url: str, path: str, content_type: str, what: str, tag: str) -> None:
         raise RuntimeError(f"Não foi possível gravar o {what} (PUT {put.status_code}).")
 
 
+def _put_parts(parts: dict, path: str, what: str, tag: str) -> list[dict]:
+    """Envia o arquivo em partes de `part_size` bytes, uma URL assinada por
+    parte (multipart do S3). Cada parte tenta 3 vezes. Devolve número e ETag
+    de cada parte, que quem pediu usa para fechar o upload."""
+    part_size = int(parts["part_size"])
+    urls = parts["urls"]
+    size = os.path.getsize(path)
+    count = max(1, math.ceil(size / part_size))
+    if count > len(urls):
+        raise RuntimeError(
+            f"O {what} ficou maior que o previsto ({size} bytes; vieram {len(urls)} partes "
+            f"de {part_size} bytes). Trate de novo."
+        )
+    done: list[dict] = []
+    with open(path, "rb") as f:
+        for number in range(1, count + 1):
+            chunk = f.read(part_size)
+            error = ""
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(3 * attempt)
+                try:
+                    put = requests.put(urls[number - 1], data=chunk, timeout=600)
+                except requests.RequestException as e:
+                    error = str(e)[:200]
+                    continue
+                if put.status_code in (200, 204) and put.headers.get("ETag"):
+                    done.append({"part": number, "etag": put.headers["ETag"]})
+                    break
+                error = f"PUT {put.status_code}"
+                log.warning("%s | parte %d do %s: %s %s", tag, number, what, error, put.text[:300])
+            else:
+                raise RuntimeError(f"Não foi possível gravar o {what} (parte {number} de {count}: {error}).")
+    log.info("%s | %s enviado em %d partes (%d bytes)", tag, what, count, size)
+    return done
+
+
 def run(params: dict, set_phase: Callable[[str], None]) -> dict:
     """Job da fila (url_jobs): trata e faz o PUT do .m4a (e do vídeo com o
-    áudio tratado, se veio `video_upload_url`) nas URLs assinadas."""
+    áudio tratado, se veio `video_upload_parts` ou `video_upload_url`) nas URLs
+    assinadas. Em partes, as ETags voltam em result["video_parts"]."""
     tag = f"audio-job={params['job_id']}"
     started = time.monotonic()
-    want_video = bool(params.get("video_upload_url"))
+    video_parts = params.get("video_upload_parts")
+    want_video = bool(video_parts or params.get("video_upload_url"))
     log.info("%s | INICIADO (ruído=%s, vídeo=%s)", tag, params.get("noise", "auto"), want_video)
     fd, out_path = tempfile.mkstemp(suffix=".m4a")
     os.close(fd)
@@ -412,7 +451,9 @@ def run(params: dict, set_phase: Callable[[str], None]) -> dict:
         result = clean(params["url"], out_path, params.get("noise", "auto"), set_phase, video_path)
         set_phase("uploading")
         _put(params["upload_url"], out_path, "audio/mp4", "áudio tratado", tag)
-        if video_path:
+        if video_path and video_parts:
+            result["video_parts"] = _put_parts(video_parts, video_path, "vídeo com o áudio tratado", tag)
+        elif video_path:
             _put(params["video_upload_url"], video_path, "video/mp4", "vídeo com o áudio tratado", tag)
         steps = ", ".join(s["key"] for s in result["steps"] if s["applied"])
         log.info(
